@@ -434,6 +434,14 @@ def test_label_free_routing_ignores_labels(tmp_path):
     assert torch.isfinite(gate).all() and torch.count_nonzero(gate).item() == 1
     assert gate.sum().item() == pytest.approx(1.0)
 
+    # aggregation=routed with K=1 predicts with the single routed expert.
+    routed_cfg = cfg.clone()
+    routed_cfg.moe.gmope.aggregation.experts = "routed"
+    routed = GMoPETask(routed_cfg, num_experts=3, route_objectives=list(objectives))
+    out = routed.predict(model, batch, CPU)
+    per_expert = routed.classifier(model.pooled_all(batch))
+    assert any(torch.allclose(out, per_expert[m], atol=1e-6) for m in range(3))
+
 
 # ---------------------------------------------------------------------------
 # Runner / run orchestration
@@ -464,6 +472,16 @@ def test_runner_two_epochs_per_task_type(tmp_path, monkeypatch, kind):
                 labels.append(batch.y)
         manual_mae = (torch.cat(preds) - torch.cat(labels)).abs().mean().item()
         assert metrics["test_mae"] == pytest.approx(manual_mae, rel=1e-5)
+
+
+def test_runner_is_deterministic(tmp_path, monkeypatch):
+    _patch_data(monkeypatch, "graph_cls")
+    metrics = []
+    for rep in range(2):
+        runner = GMoPERunner(_cfg(tmp_path / f"rep{rep}", "graph_cls"))  # pretrains from scratch each time
+        runner.fit()
+        metrics.append({k: v for k, v in runner.best_metrics.items() if k.startswith(("test_", "train_"))})
+    assert metrics[0] == metrics[1]
 
 
 def test_run_gmope_node_end_to_end_appends_result_row(tmp_path, monkeypatch):
@@ -585,8 +603,10 @@ def test_run_identity_tracks_behaviour_not_orchestration(tmp_path):
     auto, explicit = cfg.clone(), cfg.clone()
     auto.moe.gmope.num_experts = 0
     explicit.moe.gmope.num_experts = 2
+    explicit.moe.gmope.pretrain.top_k = 2
     explicit.moe.gmope.finetune.top_k = 2
     assert GMoPERunner(auto).run_name == GMoPERunner(explicit).run_name
+    assert GMoPEPretrainer(auto, "node").checkpoint_path() == GMoPEPretrainer(explicit, "node").checkpoint_path()
 
     # Route checkpoints are target, budget and finetune independent.
     target_changed = cfg.clone()

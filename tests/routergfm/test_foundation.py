@@ -206,6 +206,13 @@ def test_routing_loss_families():
     assert torch.allclose(routing_loss(pred, target, REGRESSION), torch.tensor([1.5]))
     assert torch.allclose(routing_loss(pred, target, REGRESSION, reg_kind="sq"), torch.tensor([1.25]))
     assert torch.equal(mixture_loss(p, torch.tensor([0, 1]), NODE_CLS), loss)
+    # Extra middle dims ([N, K, C]) broadcast the target over experts.
+    stacked = torch.stack([p, p.flip(0)], dim=1)
+    per_k = routing_loss(stacked, torch.tensor([0, -1]), NODE_CLS)
+    assert per_k.shape == (2, 2) and torch.isnan(per_k[1]).all()
+    assert torch.allclose(per_k[0], torch.stack([loss[0], routing_loss(p.flip(0), torch.tensor([0, 1]), NODE_CLS)[0]]))
+    reg_k = routing_loss(torch.stack([pred, pred + 1], 1), target, REGRESSION)
+    assert torch.allclose(reg_k, torch.tensor([[1.5, 1.5]]))
     with pytest.raises(ValueError):
         routing_loss(pred, target, REGRESSION, reg_kind="huber")
 
@@ -371,6 +378,13 @@ def test_stats_features():
     assert vec.numel() == len(stat_feature_names()) and torch.isfinite(vec).all()
     assert build_stats(level="graph", family=GRAPH_CLS, num_instances=1, num_nodes=1, num_edges=0,
                        feature_dim=1, num_classes=2, domain="nope", budget=1)["domain_unknown"] == 1.0
+
+
+def test_instance_set_key():
+    key = apps_mod.instance_set_key
+    assert key(AppSpec("cora", "node", 5, 0)) == key(AppSpec("cora", "node", 100, 42))
+    assert key(AppSpec("cora", "edge", 5, 42)) == key(AppSpec("cora", "edge", 100, 42))
+    assert key(AppSpec("cora", "edge", 5, 42)) != key(AppSpec("cora", "edge", 5, 0))
 
 
 # --------------------------------------------------------------------------- #

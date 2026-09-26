@@ -82,20 +82,24 @@ def routing_loss(pred: torch.Tensor, target: torch.Tensor, family: str, *, reg_k
       ``0.5 * (pred - y)^2`` (``sq``), both in normalized units (``target``
       must already be normalized).
 
+    ``pred`` may carry extra middle dims (e.g. ``[N, K, C]`` for K experts);
+    ``target`` (``[N]`` or ``[N, L]``) is broadcast and the result is ``[N, K]``.
     Rows without a valid label (negative class, or no observed assay/target)
     get NaN; callers drop NaN rows (they are not valid observations).
     """
     pred = torch.as_tensor(pred).float()
+    n, width = pred.size(0), pred.size(-1)
+    middle = [1] * (pred.dim() - 2)
     if is_simplex_family(family):
-        num_classes = pred.size(-1)
         y = torch.as_tensor(target, device=pred.device).reshape(-1).long()
-        valid = (y >= 0) & (y < num_classes)
-        onehot = F.one_hot(y.clamp(0, num_classes - 1), num_classes).float()
+        if y.numel() != n:
+            raise ValueError(f"{y.numel()} labels for {n} predictions.")
+        onehot = F.one_hot(y.clamp(0, width - 1), width).float().view(n, *middle, width)
         loss = 0.5 * (pred - onehot).pow(2).sum(dim=-1)
+        valid = ((y >= 0) & (y < width)).view(n, *middle).expand_as(loss)
         return torch.where(valid, loss, torch.full_like(loss, float("nan")))
 
-    y = torch.as_tensor(target, device=pred.device).float().reshape(pred.shape)
-    valid = torch.isfinite(y)
+    y = torch.as_tensor(target, device=pred.device).float().reshape(n, *middle, width)
     diff = pred - torch.nan_to_num(y, nan=0.0)
     if family == MULTILABEL:
         elem = diff.pow(2)
@@ -108,8 +112,7 @@ def routing_loss(pred: torch.Tensor, target: torch.Tensor, family: str, *, reg_k
             raise ValueError(f"Unknown regression routing loss {reg_kind!r} (expected abs|sq).")
     else:
         raise ValueError(f"Unknown task family {family!r}.")
-    elem = elem.reshape(elem.size(0), -1)
-    valid = valid.reshape(valid.size(0), -1)
+    valid = torch.isfinite(y).expand_as(elem)
     count = valid.sum(dim=-1)
     loss = (elem * valid).sum(dim=-1) / count.clamp_min(1)
     return torch.where(count > 0, loss, torch.full_like(loss, float("nan")))

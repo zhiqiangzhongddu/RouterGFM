@@ -256,6 +256,7 @@ class TextEncoder:
                 todo.append(text)
         if todo:
             for text, emb in zip(todo, self._bert_embed(todo)):
+                emb = emb.clone()  # own storage: saving a row view would write the whole batch
                 save_torch_atomic(str(self._cache_path(text)), {"embedding": emb})
                 self._memo[text] = emb
         return torch.stack([self._memo[t] for t in texts]).float()

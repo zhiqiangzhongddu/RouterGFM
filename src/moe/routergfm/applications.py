@@ -12,7 +12,7 @@ from __future__ import annotations
 import math
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence
+from typing import Any, Callable, Dict, List, Protocol
 
 import torch
 
@@ -207,6 +207,16 @@ def diagnostic_subsample(labels: torch.Tensor, family: str, cap: int, seed: int)
     return torch.sort(torch.cat(chosen)).values
 
 
+def instance_set_key(app: AppSpec) -> str:
+    """Identity of an application's instance set: split-independent except for LP.
+
+    Induced node subgraphs and graph datasets do not depend on the split, so
+    positions of every budget/seed index the same instances; induced LP
+    subgraphs are built per edge split (data key).
+    """
+    return app.data_key if app.task_level == "edge" else f"{app.dataset}__{app.task_level}"
+
+
 def assemble_app_data(app: AppSpec, meta: Dict[str, Any], dataset: Any, max_diagnostic: int) -> AppData:
     """AppData from split-level metadata (see ``RealDataProvider``); adds D_a and budget stats."""
     family = meta["task_family"]
@@ -293,10 +303,6 @@ class RealDataProvider:
         return assemble_app_data(app, meta, dataset, int(self.cfg.moe.routergfm.apps.max_diagnostic))
 
     # -- datasets -----------------------------------------------------------
-    @staticmethod
-    def _dataset_key(app: AppSpec) -> str:
-        return app.data_key if app.task_level == "edge" else f"{app.dataset}__{app.task_level}"
-
     def _remember(self, key: str, dataset: Any) -> None:
         self._datasets[key] = dataset
         self._datasets.move_to_end(key)
@@ -304,7 +310,7 @@ class RealDataProvider:
             self._datasets.popitem(last=False)
 
     def _dataset(self, app: AppSpec):
-        key = self._dataset_key(app)
+        key = instance_set_key(app)
         if key in self._datasets:
             self._datasets.move_to_end(key)
             return self._datasets[key]
@@ -426,8 +432,8 @@ class RealDataProvider:
             domain=domain,
             budget=int(app.budget),
         )
-        if self._dataset_key(app) not in self._datasets:
-            self._remember(self._dataset_key(app), dataset)
+        if instance_set_key(app) not in self._datasets:
+            self._remember(instance_set_key(app), dataset)
         return {
             "version": _META_VERSION,
             "app": app.to_dict(),
@@ -458,6 +464,7 @@ __all__ = [
     "derive_seed",
     "diagnostic_subsample",
     "gather_labels",
+    "instance_set_key",
     "stat_feature_names",
     "stats_feature_vector",
     "valid_label_mask",

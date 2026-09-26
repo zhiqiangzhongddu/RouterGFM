@@ -17,4 +17,14 @@ def set_data_preparation_cfg(cfg: CN) -> CN:
     cfg.data_preparation.num_workers = 0  # data loading workers for split-stat materialization during data prep
     cfg.data_preparation.summary_file = "data/summary.tsv"  # output file for dataset summary information
 
+    # Distribution-shift split roots (RouterGFM Table 15; our protocol, see src/data_loader/shift_splits.py).
+    cfg.data_preparation.shift = CN()
+    cfg.data_preparation.shift.build = False  # write shift split files for the target datasets' few-shot splits and seeds
+    cfg.data_preparation.shift.verify = False  # assert every shift split file is intact (meta.type == "shift_covariate")
+    cfg.data_preparation.shift.root = "data/splits_shift"  # files under <root>/<condition>/; select one via data_preparation.dataset.split_root
+    cfg.data_preparation.shift.conditions = ["feature", "structural", "mixed"]
+    cfg.data_preparation.shift.source_quantile = 0.6  # support region: rank-normalized statistic <= q (GOOD bins 1-3)
+    cfg.data_preparation.shift.target_quantile = 0.8  # query region: rank-normalized statistic >= q (GOOD bin 5)
+    cfg.data_preparation.shift.min_queries = 100  # mixed condition lowers its target quantile (floor 0.65) until this many queries
+
     return cfg

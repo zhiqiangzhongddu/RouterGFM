@@ -430,7 +430,7 @@ class PlumbingTest(unittest.TestCase):
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write("# dataset\ttask_level\ttask_type\texperts\tfixed_split\tgate_epochs\tskip_if_exists\n")
                 fh.write("dblp\tedge\tclassification\tmlp,gcn\t(0.1,0.05,0.1)\t50\tFalse\n")
-                fh.write("cornell\tedge\t-\t-\t-\t-\tTrue\n")
+                fh.write("cornell\tedge\tnone\t-\t-\t-\tTrue\n")
             tasks = parse_linkmoe_tasks(path)
         self.assertEqual(len(tasks), 2)
         self.assertEqual(tasks[0]["experts"], ("mlp", "gcn"))
