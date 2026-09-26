@@ -1,0 +1,68 @@
+# ignore Python cache files
+*__pycache__
+# ignore VSCode settings and workspace files
+.vscode/
+# ignore codex files and settings
+.codex
+# ignore claude files and settings
+.claude
+
+# never commit API keys
+src/config/api_key.py
+
+# ignore heavy data files but keep .gitkeep files for directory structure
+data/splits/*
+!data/splits/.gitkeep
+data/datasets/*
+!data/datasets/.gitkeep
+data/feature_svd/*
+!data/feature_svd/.gitkeep
+data/induced_subgraphs/*
+!data/induced_subgraphs/.gitkeep
+data/subgraph_svd/*
+!data/subgraph_svd/.gitkeep
+data/anygraph_data/*
+!data/anygraph_data/.gitkeep
+data/filters/*
+!data/filters/.gitkeep
+
+# ignore outputs but keep .gitkeep files for directory structure
+outputs/*
+!outputs/.gitkeep
+!outputs/results/
+!outputs/figures/
+
+# ignore logs but keep .gitkeep files for directory structure
+# (lives under the wholesale-ignored outputs/, so re-include the tree first)
+!outputs/logs/
+outputs/logs/*
+!outputs/logs/.gitkeep
+
+# ignore trained model checkpoints but keep .gitkeep files for directory structure
+!outputs/trained_models/
+outputs/trained_models/*
+!outputs/trained_models/.gitkeep
+
+# ignore pretrained model checkpoints but keep .gitkeep files for directory structure
+!outputs/pretrained_models/
+outputs/pretrained_models/*
+!outputs/pretrained_models/.gitkeep
+
+# ignore finetuned model checkpoints but keep .gitkeep files for directory structure
+!outputs/finetuned_models/
+outputs/finetuned_models/*
+!outputs/finetuned_models/.gitkeep
+
+# ignore routergfm generated artifacts (records, interactions, context graph,
+# selection, integration, prediction) but keep .gitkeep files at any depth
+# (lives under the wholesale-ignored outputs/, so re-include the tree first)
+!outputs/routergfm/
+outputs/routergfm/**
+!outputs/routergfm/**/
+!outputs/routergfm/**/.gitkeep
+
+# ignore slurm outputs but keep .gitkeep files for directory structure
+slurm/output/*
+!slurm/output/.gitkeep
+
+*.lock

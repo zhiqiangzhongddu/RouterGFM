@@ -1,0 +1,17 @@
+# dataset	task_level	task_type
+cora	    node	    classification
+cora	    edge	    classification
+pubmed	    node	    classification
+computers	node	    classification
+flickr	    node	    classification
+actor	    node	    classification
+actor	    edge	    classification
+squirrel	node	    classification
+squirrel	edge	    classification
+email	    node	    classification
+email	    edge	    classification
+bbbp	    graph	    classification
+tox21	    graph	    classification
+qm9	        graph	    regression
+proteins	graph	    classification
+cifar10	    graph	    classification

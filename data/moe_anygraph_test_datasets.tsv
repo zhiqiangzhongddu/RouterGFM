@@ -1,0 +1,10 @@
+# dataset	task_level	task_type
+photo	    node	    classification
+ogbn-arxiv	node	    classification
+airports	node	    classification
+chameleon	node	    classification
+dblp	    edge	    classification
+cornell	    edge	    classification
+mnist	    graph	    classification
+qm7b	    graph	    regression
+toxcast	    graph	    classification
