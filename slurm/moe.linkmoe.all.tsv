@@ -1,0 +1,4 @@
+# dataset	task_level	task_type	experts	fixed_split	gate_epochs	skip_if_exists
+# Link prediction only (Table 7): one configuration per dataset, reported in both the 5-shot and 100-shot blocks.
+dblp	edge	classification	mlp,gcn,ncn,seal	(0.1,0.05,0.1)	800	True
+cornell	edge	classification	mlp,gcn,ncn,seal	(0.1,0.05,0.1)	800	True

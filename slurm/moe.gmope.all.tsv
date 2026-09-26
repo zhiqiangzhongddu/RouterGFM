@@ -1,0 +1,20 @@
+# dataset	task_level	task_type	induced	fixed_split	epochs	batch	skip_if_exists
+# Paper sweep: 9 test datasets x {5-shot, 100-shot} (LP datasets use (0.1,0.05,0.1) once for both tables).
+# Pretrained route checkpoints (node, graph) are shared by all rows; submit STAGE=pretrain first (see slurm/moe.gmope.slurm).
+# Rows ordered heaviest-first so long rows start early under round-robin workers.
+ogbn-arxiv	node	classification	True	(100,0.0,1.0)	200	128	True
+ogbn-arxiv	node	classification	True	(5,0.0,1.0)	200	128	True
+dblp	edge	classification	True	(0.1,0.05,0.1)	200	32	True
+mnist	graph	classification	True	(100,0.0,1.0)	200	128	True
+mnist	graph	classification	True	(5,0.0,1.0)	200	128	True
+toxcast	graph	classification	True	(100,0.0,1.0)	200	32	True
+toxcast	graph	classification	True	(5,0.0,1.0)	200	32	True
+qm7b	graph	regression	True	(100,0.0,1.0)	200	32	True
+qm7b	graph	regression	True	(5,0.0,1.0)	200	32	True
+photo	node	classification	True	(100,0.0,1.0)	200	32	True
+photo	node	classification	True	(5,0.0,1.0)	200	32	True
+chameleon	node	classification	True	(100,0.0,1.0)	200	32	True
+chameleon	node	classification	True	(5,0.0,1.0)	200	32	True
+airports	node	classification	True	(100,0.0,1.0)	200	32	True
+airports	node	classification	True	(5,0.0,1.0)	200	32	True
+cornell	edge	classification	True	(0.1,0.05,0.1)	200	32	True

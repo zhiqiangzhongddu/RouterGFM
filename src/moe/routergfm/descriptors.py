@@ -291,6 +291,8 @@ def descriptors_at(cache: Dict[str, Any], positions) -> torch.Tensor:
     """Rows of a descriptor cache for dataset *positions* (in their order)."""
     positions = torch.as_tensor(positions, dtype=torch.long).view(-1)
     cached = cache["positions"]
+    if positions.numel() == 0:
+        return cache["z"][:0]
     idx = torch.searchsorted(cached, positions).clamp(max=max(cached.numel() - 1, 0))
     if cached.numel() == 0 or not bool((cached[idx] == positions).all()):
         raise KeyError("descriptor cache does not cover the requested positions")
