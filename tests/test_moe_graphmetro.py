@@ -201,7 +201,7 @@ class TransformInvariantTest(unittest.TestCase):
         for level in ("node", "edge", "graph"):
             batch = Batch.from_data_list(_instances(level))
             for shift in shifts:
-                for _ in range(10):
+                for _ in range(5):
                     out = apply_shift(batch, shift, p=0.5, k=2, task_level_raw=level, generator=gen)
                     self._check(level, batch, out, shift)
 

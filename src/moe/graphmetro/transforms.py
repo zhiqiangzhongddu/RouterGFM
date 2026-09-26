@@ -106,8 +106,10 @@ def _add_edge(data: Data, p: float, level: str, g: torch.Generator) -> Data:
         u, v = _protected(data, level).tolist()
         blocked[u, v] = blocked[v, u] = True
     if undirected:
-        blocked = blocked | blocked.t()
-        candidates = (~blocked).triu(1).nonzero()
+        ids = torch.arange(n, device=edge_index.device)
+        # Upper triangle via an index comparison (bool ``triu`` is very slow on CPU).
+        blocked = blocked | blocked.t() | (ids.unsqueeze(1) >= ids.unsqueeze(0))
+        candidates = (~blocked).nonzero()
         num_new //= 2
     else:
         candidates = (~blocked).nonzero()

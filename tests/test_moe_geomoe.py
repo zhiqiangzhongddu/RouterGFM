@@ -114,9 +114,10 @@ def _patched_data(kind, count=16, num_train=8):
             DataLoader(Subset(graphs, list(range(num_train, count))), batch_size=4),
         )
 
-    return graphs, patch.multiple(
+    create = MagicMock(return_value=graphs)
+    return graphs, create, patch.multiple(
         "src.moe.geomoe.trainer",
-        create_dataset=MagicMock(return_value=graphs),
+        create_dataset=create,
         dataset_info=lambda **_kwargs: dict(_META[kind]),
         make_workflow_loaders=_loaders,
         log_split_instance_counts=lambda *args, **kwargs: None,
@@ -253,12 +254,17 @@ class ModelAndLossTest(unittest.TestCase):
         logits = self.task.contrastive_logits(fused, experts, kappa)
         self.assertEqual(tuple(logits.shape), (n, 1 + self.task.num_negatives))
         region = orc_region(kappa, self.task.theta)
-        index = hard_negative_index(experts[torch.arange(n), region], fused, region, 4)
+        h_pos = experts[torch.arange(n), region]
+        index = hard_negative_index(h_pos, fused, region, 4)
         for v in range(n):
             chosen = index[v].tolist()
             self.assertNotIn(v, chosen)
-            others = [u for u in range(n) if region[u] != region[v]]
-            self.assertEqual(set(chosen[: len(others)]), set(others[:4]) if len(others) >= 4 else set(others))
+            sims = torch.nn.functional.cosine_similarity(h_pos[v][None], fused, dim=-1)
+            others = sorted((u for u in range(n) if region[u] != region[v]), key=lambda u: -float(sims[u]))
+            if len(others) >= 4:  # the most similar different-region nodes
+                self.assertEqual(chosen, others[:4])
+            else:  # all different-region nodes first, then same-region fill
+                self.assertEqual(chosen[: len(others)], others)
         # All nodes in one region: fall back to same-region nodes ranked by similarity.
         flat = torch.zeros(n)
         idx = hard_negative_index(experts[:, 0], fused, orc_region(flat, 1e-4), 3)
@@ -314,7 +320,7 @@ class ModelAndLossTest(unittest.TestCase):
 
 class RunnerSmokeTest(unittest.TestCase):
     def _fit(self, kind, tmp, **extra):
-        graphs, patcher = _patched_data(kind)
+        graphs, _, patcher = _patched_data(kind)
         with patcher:
             cfg = _smoke_cfg(tmp, kind, **extra)
             runner = GeoMoERunner(cfg)
@@ -350,7 +356,7 @@ class RunnerSmokeTest(unittest.TestCase):
             self.assertEqual(spy.call_count, 8)
 
     def test_run_geomoe_appends_result_row_and_skips_existing(self):
-        graphs, patcher = _patched_data("node")
+        _, _, patcher = _patched_data("node")
         with tempfile.TemporaryDirectory() as tmp, patcher:
             cfg = _smoke_cfg(tmp, "node")
             self.assertEqual(run_geomoe(cfg), 0)
@@ -363,20 +369,20 @@ class RunnerSmokeTest(unittest.TestCase):
 
 class ShiftRootGuardTest(unittest.TestCase):
     def test_missing_shift_file_fails_before_loading(self):
-        graphs, patcher = _patched_data("node")
-        with tempfile.TemporaryDirectory() as tmp, patcher as mocks:
+        _, create, patcher = _patched_data("node")
+        with tempfile.TemporaryDirectory() as tmp, patcher:
             cfg = _smoke_cfg(tmp, "node")
             cfg.data_preparation.shift.root = os.path.join(tmp, "shift")
             cfg.data_preparation.dataset.split_root = os.path.join(tmp, "shift", "structural")
             with self.assertRaisesRegex(ValueError, "missing"):
                 GeoMoERunner(cfg).fit()
-            mocks["create_dataset"].assert_not_called()
+            create.assert_not_called()
 
     def test_intact_shift_file_passes(self):
         from src.data_loader.shift_splits import SHIFT_SPLIT_TYPE, split_file_path
 
-        graphs, patcher = _patched_data("node")
-        with tempfile.TemporaryDirectory() as tmp, patcher as mocks:
+        _, create, patcher = _patched_data("node")
+        with tempfile.TemporaryDirectory() as tmp, patcher:
             cfg = _smoke_cfg(tmp, "node")
             cfg.data_preparation.shift.root = os.path.join(tmp, "shift")
             root = os.path.join(tmp, "shift", "structural")
@@ -386,7 +392,7 @@ class ShiftRootGuardTest(unittest.TestCase):
             torch.save({"train": [0, 1], "val": [2], "test": [3, 4],
                         "meta": {"type": SHIFT_SPLIT_TYPE, "condition": "structural", "total": 5}}, path)
             GeoMoERunner(cfg).fit()
-            mocks["create_dataset"].assert_called_once()
+            create.assert_called_once()
             # A standard (non-shift) file under the shift root is rejected.
             torch.save({"train": [0, 1], "val": [2], "test": [3, 4], "meta": {"total": 5}}, path)
             with self.assertRaisesRegex(ValueError, "not a shift split"):

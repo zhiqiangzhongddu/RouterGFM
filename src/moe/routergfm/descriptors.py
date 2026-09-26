@@ -93,12 +93,15 @@ def _dense_batch(graphs: Sequence[Any], level: str, task_family: str, k: int, de
     nf = n.to(dt)
     count = nf.clamp(min=1)
 
-    edge_index = [g.edge_index.to(device=device, dtype=torch.long) for g in graphs]
-    eb = torch.repeat_interleave(bi, torch.tensor([e.size(1) for e in edge_index], device=device))
-    src, dst = torch.cat(edge_index, dim=1)
+    # Concatenate on CPU: CUDA rejects a cat of only empty tensors (a bucket of
+    # isolated single-node contexts has no edges at all).
+    edge_index = [g.edge_index.to(dtype=torch.long).cpu() for g in graphs]
+    eb = torch.repeat_interleave(torch.arange(B), torch.tensor([e.size(1) for e in edge_index])).to(device)
+    src, dst = torch.cat(edge_index, dim=1).to(device)
     A = torch.zeros(B, n_max, n_max, dtype=dt, device=device)
-    A[eb, src, dst] = 1.0
-    A[eb, dst, src] = 1.0  # undirected, simple
+    if eb.numel() > 0:
+        A[eb, src, dst] = 1.0
+        A[eb, dst, src] = 1.0  # undirected, simple
     A[:, ar, ar] = 0.0
     if level == "edge":
         pair = torch.stack([g.edge_label_index.view(2, -1)[:, 0] for g in graphs]).to(device)

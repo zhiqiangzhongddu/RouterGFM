@@ -35,8 +35,9 @@ def load_runner_class(method: str):
 
 
 def config_block_name(method: str) -> str:
-    """Name of the method's config subtree ``cfg.moe.routergfm.baselines.<name>`` (its module name)."""
-    return BASELINE_RUNNERS[method][0].rsplit(".", 1)[-1]
+    """Name of the method's config subtree ``cfg.moe.routergfm.baselines.<name>``: its module name
+    (``kdem``/``ppem`` -> ``kdem_ppem``), or *method* itself when unregistered."""
+    return BASELINE_RUNNERS[method][0].rsplit(".", 1)[-1] if method in BASELINE_RUNNERS else method
 
 
 __all__ = ["BASELINE_RUNNERS", "config_block_name", "load_runner_class"]
