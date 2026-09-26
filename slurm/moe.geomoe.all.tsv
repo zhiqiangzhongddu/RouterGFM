@@ -1,0 +1,43 @@
+# dataset	task_level	task_type	induced	fixed_split	split_root	skip_if_exists
+# RouterGFM Table 15 shift sweep (our protocol, src/data_loader/shift_splits.py): 7 applications x {5,100}-shot x
+# {feature, structural, mixed}; qm7b is featureless, so it has no feature-shift split. Rows heaviest-first.
+ogbn-arxiv	node	classification	True	(100,0.0,1.0)	data/splits_shift/feature	True
+ogbn-arxiv	node	classification	True	(100,0.0,1.0)	data/splits_shift/structural	True
+ogbn-arxiv	node	classification	True	(100,0.0,1.0)	data/splits_shift/mixed	True
+ogbn-arxiv	node	classification	True	(5,0.0,1.0)	data/splits_shift/feature	True
+ogbn-arxiv	node	classification	True	(5,0.0,1.0)	data/splits_shift/structural	True
+ogbn-arxiv	node	classification	True	(5,0.0,1.0)	data/splits_shift/mixed	True
+mnist	graph	classification	True	(100,0.0,1.0)	data/splits_shift/feature	True
+mnist	graph	classification	True	(100,0.0,1.0)	data/splits_shift/structural	True
+mnist	graph	classification	True	(100,0.0,1.0)	data/splits_shift/mixed	True
+mnist	graph	classification	True	(5,0.0,1.0)	data/splits_shift/feature	True
+mnist	graph	classification	True	(5,0.0,1.0)	data/splits_shift/structural	True
+mnist	graph	classification	True	(5,0.0,1.0)	data/splits_shift/mixed	True
+toxcast	graph	classification	True	(100,0.0,1.0)	data/splits_shift/feature	True
+toxcast	graph	classification	True	(100,0.0,1.0)	data/splits_shift/structural	True
+toxcast	graph	classification	True	(100,0.0,1.0)	data/splits_shift/mixed	True
+toxcast	graph	classification	True	(5,0.0,1.0)	data/splits_shift/feature	True
+toxcast	graph	classification	True	(5,0.0,1.0)	data/splits_shift/structural	True
+toxcast	graph	classification	True	(5,0.0,1.0)	data/splits_shift/mixed	True
+qm7b	graph	regression	True	(100,0.0,1.0)	data/splits_shift/structural	True
+qm7b	graph	regression	True	(100,0.0,1.0)	data/splits_shift/mixed	True
+qm7b	graph	regression	True	(5,0.0,1.0)	data/splits_shift/structural	True
+qm7b	graph	regression	True	(5,0.0,1.0)	data/splits_shift/mixed	True
+photo	node	classification	True	(100,0.0,1.0)	data/splits_shift/feature	True
+photo	node	classification	True	(100,0.0,1.0)	data/splits_shift/structural	True
+photo	node	classification	True	(100,0.0,1.0)	data/splits_shift/mixed	True
+photo	node	classification	True	(5,0.0,1.0)	data/splits_shift/feature	True
+photo	node	classification	True	(5,0.0,1.0)	data/splits_shift/structural	True
+photo	node	classification	True	(5,0.0,1.0)	data/splits_shift/mixed	True
+chameleon	node	classification	True	(100,0.0,1.0)	data/splits_shift/feature	True
+chameleon	node	classification	True	(100,0.0,1.0)	data/splits_shift/structural	True
+chameleon	node	classification	True	(100,0.0,1.0)	data/splits_shift/mixed	True
+chameleon	node	classification	True	(5,0.0,1.0)	data/splits_shift/feature	True
+chameleon	node	classification	True	(5,0.0,1.0)	data/splits_shift/structural	True
+chameleon	node	classification	True	(5,0.0,1.0)	data/splits_shift/mixed	True
+airports	node	classification	True	(100,0.0,1.0)	data/splits_shift/feature	True
+airports	node	classification	True	(100,0.0,1.0)	data/splits_shift/structural	True
+airports	node	classification	True	(100,0.0,1.0)	data/splits_shift/mixed	True
+airports	node	classification	True	(5,0.0,1.0)	data/splits_shift/feature	True
+airports	node	classification	True	(5,0.0,1.0)	data/splits_shift/structural	True
+airports	node	classification	True	(5,0.0,1.0)	data/splits_shift/mixed	True

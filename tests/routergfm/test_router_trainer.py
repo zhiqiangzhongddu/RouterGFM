@@ -181,7 +181,8 @@ def test_fit_reduces_losses_and_restores_best_state(fitted):
     assert tr.evaluate()["loss"] == pytest.approx(log["best_val_loss"], rel=1e-6)
     assert log["best_val_loss"] < fitted.before["val"]
     assert _train_objective(tr) < fitted.before["train"]
-    assert all(torch.isfinite(torch.tensor([e["train_loss"], e["train_glob"], e["train_loc"]])).all() for e in log["epochs"])
+    train = torch.tensor([[e["train_loss"], e["train_glob"], e["train_loc"]] for e in log["epochs"]])
+    assert bool(torch.isfinite(train).all())
 
 
 def test_early_stopping(env):

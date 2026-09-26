@@ -157,7 +157,9 @@ class RouterTrainer:
         self._episodes = {ep.app.key: ep for ep in self._train + self._val}
         # Fixed validation pairs keep the criterion comparable across epochs.
         self._val_pairs = {
-            ep.app.key: self._sample_pairs(ep, torch.Generator().manual_seed(derive_seed(self.seed, "val_pairs", ep.app.key)))
+            ep.app.key: self._sample_pairs(
+                ep, torch.Generator().manual_seed(derive_seed(self.seed, "val_pairs", ep.app.key))
+            )
             for ep in self._val
         }
         self.rho = float(self.rt.rho) if float(self.rt.rho) >= 0 else None
@@ -223,9 +225,8 @@ class RouterTrainer:
         """``k_phi(c_i, v_{e_i})`` of every archive record with the current parameters."""
         v = self.model.project(self.graph.x)[EXPERT]
         rep, nodes = self.archive.rep, self._rec_node
-        return torch.cat(
-            [self.model.keys(rep[s:s + _KEY_CHUNK], v[nodes[s:s + _KEY_CHUNK]]) for s in range(0, len(self.archive), _KEY_CHUNK)]
-        )
+        chunks = range(0, len(self.archive), _KEY_CHUNK)
+        return torch.cat([self.model.keys(rep[s:s + _KEY_CHUNK], v[nodes[s:s + _KEY_CHUNK]]) for s in chunks])
 
     def _retrieve(
         self, z: torch.Tensor, nodes: torch.Tensor, v: torch.Tensor, record_keys: torch.Tensor, allowed: torch.Tensor
@@ -481,7 +482,9 @@ def _validation_groups(
     return groups
 
 
-def build_router_trainer(cfg, target_group: str, budget: int, provider=None, seed: Optional[int] = None, device=None) -> RouterTrainer:
+def build_router_trainer(
+    cfg, target_group: str, budget: int, provider=None, seed: Optional[int] = None, device=None
+) -> RouterTrainer:
     """RouterTrainer for one target group and budget, built from the history of every other group.
 
     Training applications are the declared applications with history outside
@@ -529,7 +532,9 @@ def build_router_trainer(cfg, target_group: str, budget: int, provider=None, see
         "seed": seed,
         "run_key": router_run_key(target_group, budget, seed),
         "val_groups": list(val_groups),
-        "cfg_hash": stable_hash({k: cfg_to_dict(rg[k]) for k in ("router", "descriptors", "archive", "graph", "heads", "loss")}),
+        "cfg_hash": stable_hash(
+            {k: cfg_to_dict(rg[k]) for k in ("router", "descriptors", "archive", "graph", "heads", "loss")}
+        ),
     }
     return RouterTrainer(
         cfg, infra.catalog, apps_train, apps_val, infra.store, graph, archive, standardizer, descriptors,

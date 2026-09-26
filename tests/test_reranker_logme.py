@@ -1,11 +1,8 @@
 """Tests for the train-label-only LogME expert selection baseline."""
 
-import pytest
 import torch
 
-logme = pytest.importorskip("src.moe.routergfm.baselines.logme")
-logme_score = logme.logme_score
-rank_experts_by_evidence = logme.rank_experts_by_evidence
+from src.moe.routergfm.baselines.selection.logme import logme_score, rank_experts_by_evidence
 
 
 def _make_classification(n_per_class=20, d=32, classes=4, noise=0.1, seed=0):

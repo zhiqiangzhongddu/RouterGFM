@@ -1,0 +1,59 @@
+# dataset	task_level	task_type	induced	fixed_split	split_root	batch	skip_if_exists
+# Table 15 shift sweep: 7 node/graph datasets x {5,100}-shot x {feature, structural, mixed} shift roots
+# (built by `python -m src.data_loader.shift_splits ... data_preparation.shift.build True`), plus the
+# standard split root as an unshifted reference. qm7b is featureless: no feature-condition row. LP has no
+# shift splits. Rows ordered heaviest-first so long rows start early under round-robin workers.
+ogbn-arxiv	node	classification	True	(100,0.0,1.0)	data/splits_shift/feature	128	True
+ogbn-arxiv	node	classification	True	(100,0.0,1.0)	data/splits_shift/structural	128	True
+ogbn-arxiv	node	classification	True	(100,0.0,1.0)	data/splits_shift/mixed	128	True
+ogbn-arxiv	node	classification	True	(100,0.0,1.0)	data/splits	128	True
+ogbn-arxiv	node	classification	True	(5,0.0,1.0)	data/splits_shift/feature	128	True
+ogbn-arxiv	node	classification	True	(5,0.0,1.0)	data/splits_shift/structural	128	True
+ogbn-arxiv	node	classification	True	(5,0.0,1.0)	data/splits_shift/mixed	128	True
+ogbn-arxiv	node	classification	True	(5,0.0,1.0)	data/splits	128	True
+mnist	graph	classification	True	(100,0.0,1.0)	data/splits_shift/feature	128	True
+mnist	graph	classification	True	(100,0.0,1.0)	data/splits_shift/structural	128	True
+mnist	graph	classification	True	(100,0.0,1.0)	data/splits_shift/mixed	128	True
+mnist	graph	classification	True	(100,0.0,1.0)	data/splits	128	True
+mnist	graph	classification	True	(5,0.0,1.0)	data/splits_shift/feature	128	True
+mnist	graph	classification	True	(5,0.0,1.0)	data/splits_shift/structural	128	True
+mnist	graph	classification	True	(5,0.0,1.0)	data/splits_shift/mixed	128	True
+mnist	graph	classification	True	(5,0.0,1.0)	data/splits	128	True
+toxcast	graph	classification	True	(100,0.0,1.0)	data/splits_shift/feature	32	True
+toxcast	graph	classification	True	(100,0.0,1.0)	data/splits_shift/structural	32	True
+toxcast	graph	classification	True	(100,0.0,1.0)	data/splits_shift/mixed	32	True
+toxcast	graph	classification	True	(100,0.0,1.0)	data/splits	32	True
+toxcast	graph	classification	True	(5,0.0,1.0)	data/splits_shift/feature	32	True
+toxcast	graph	classification	True	(5,0.0,1.0)	data/splits_shift/structural	32	True
+toxcast	graph	classification	True	(5,0.0,1.0)	data/splits_shift/mixed	32	True
+toxcast	graph	classification	True	(5,0.0,1.0)	data/splits	32	True
+qm7b	graph	regression	True	(100,0.0,1.0)	data/splits_shift/structural	32	True
+qm7b	graph	regression	True	(100,0.0,1.0)	data/splits_shift/mixed	32	True
+qm7b	graph	regression	True	(100,0.0,1.0)	data/splits	32	True
+qm7b	graph	regression	True	(5,0.0,1.0)	data/splits_shift/structural	32	True
+qm7b	graph	regression	True	(5,0.0,1.0)	data/splits_shift/mixed	32	True
+qm7b	graph	regression	True	(5,0.0,1.0)	data/splits	32	True
+photo	node	classification	True	(100,0.0,1.0)	data/splits_shift/feature	32	True
+photo	node	classification	True	(100,0.0,1.0)	data/splits_shift/structural	32	True
+photo	node	classification	True	(100,0.0,1.0)	data/splits_shift/mixed	32	True
+photo	node	classification	True	(100,0.0,1.0)	data/splits	32	True
+photo	node	classification	True	(5,0.0,1.0)	data/splits_shift/feature	32	True
+photo	node	classification	True	(5,0.0,1.0)	data/splits_shift/structural	32	True
+photo	node	classification	True	(5,0.0,1.0)	data/splits_shift/mixed	32	True
+photo	node	classification	True	(5,0.0,1.0)	data/splits	32	True
+chameleon	node	classification	True	(100,0.0,1.0)	data/splits_shift/feature	32	True
+chameleon	node	classification	True	(100,0.0,1.0)	data/splits_shift/structural	32	True
+chameleon	node	classification	True	(100,0.0,1.0)	data/splits_shift/mixed	32	True
+chameleon	node	classification	True	(100,0.0,1.0)	data/splits	32	True
+chameleon	node	classification	True	(5,0.0,1.0)	data/splits_shift/feature	32	True
+chameleon	node	classification	True	(5,0.0,1.0)	data/splits_shift/structural	32	True
+chameleon	node	classification	True	(5,0.0,1.0)	data/splits_shift/mixed	32	True
+chameleon	node	classification	True	(5,0.0,1.0)	data/splits	32	True
+airports	node	classification	True	(100,0.0,1.0)	data/splits_shift/feature	32	True
+airports	node	classification	True	(100,0.0,1.0)	data/splits_shift/structural	32	True
+airports	node	classification	True	(100,0.0,1.0)	data/splits_shift/mixed	32	True
+airports	node	classification	True	(100,0.0,1.0)	data/splits	32	True
+airports	node	classification	True	(5,0.0,1.0)	data/splits_shift/feature	32	True
+airports	node	classification	True	(5,0.0,1.0)	data/splits_shift/structural	32	True
+airports	node	classification	True	(5,0.0,1.0)	data/splits_shift/mixed	32	True
+airports	node	classification	True	(5,0.0,1.0)	data/splits	32	True
