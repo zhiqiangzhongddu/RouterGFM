@@ -10,13 +10,14 @@ LP convention ignores its validation positives.
 from __future__ import annotations
 
 import math
+import os
 from collections import OrderedDict
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Protocol
 
 import torch
 
-from src.data_loader.dataset_domains import CLASS_TO_DOMAIN, KEYWORD_DOMAINS, NAME_TO_DOMAIN
 from src.utils.checkpoint import save_torch_atomic
 from src.utils.supervised_loss import binary_targets_and_valid, prepare_class_labels
 
@@ -31,14 +32,12 @@ from .common import (
     stable_hash,
 )
 from .losses import is_simplex_family
+from .text import DOMAINS, dataset_domain
 
 TASK_LEVELS = ("node", "edge", "graph")
-DOMAINS = tuple(
-    sorted(set(CLASS_TO_DOMAIN.values()) | set(NAME_TO_DOMAIN.values()) | {d for d, _ in KEYWORD_DOMAINS})
-) + ("unknown",)
 # Count-valued statistics; metadata features use log1p of these.
 STAT_COUNT_KEYS = ("num_instances", "num_nodes", "num_edges", "avg_degree", "feature_dim", "num_classes", "budget")
-_META_VERSION = 1
+_META_VERSION = 2
 
 
 @dataclass
@@ -60,6 +59,8 @@ class AppData:
 class DataProvider(Protocol):
     def load(self, app: AppSpec) -> AppData: ...
 
+    def base_graph(self, app: AppSpec) -> Any: ...
+
 
 # --------------------------------------------------------------------------- #
 # Pure helpers (shared with the synthetic test provider)
@@ -67,17 +68,6 @@ class DataProvider(Protocol):
 def derive_seed(*parts: Any) -> int:
     """Deterministic 31-bit seed from arbitrary JSON-serializable parts."""
     return int(stable_hash(list(parts), length=8), 16) % (2**31 - 1)
-
-
-def dataset_domain(name: str) -> str:
-    """Coarse domain of a dataset name (``src.data_loader.dataset_domains`` rules)."""
-    key = str(name).lower()
-    if key in NAME_TO_DOMAIN:
-        return NAME_TO_DOMAIN[key]
-    for domain, keywords in KEYWORD_DOMAINS:
-        if any(token in key for token in keywords):
-            return domain
-    return "unknown"
 
 
 def build_stats(
@@ -248,16 +238,18 @@ def assemble_app_data(app: AppSpec, meta: Dict[str, Any], dataset: Any, max_diag
 # Real datasets
 # --------------------------------------------------------------------------- #
 class _LazyDataset:
-    """Defers building a dataset until an item, length, or attribute is requested."""
+    """Defers building a dataset until an item, length, or attribute is requested.
+
+    Holds no reference to the built object: every access goes through *build*
+    (the provider's LRU), so evicted datasets are freed even while their
+    AppData stays cached.
+    """
 
     def __init__(self, build: Callable[[], Any]):
         self._build = build
-        self._obj = None
 
     def _get(self):
-        if self._obj is None:
-            self._obj = self._build()
-        return self._obj
+        return self._build()
 
     def __len__(self) -> int:
         return len(self._get())
@@ -266,7 +258,7 @@ class _LazyDataset:
         return self._get()[idx]
 
     def __getattr__(self, name: str):
-        if name.startswith("__") or name in ("_build", "_obj"):
+        if name.startswith("__") or name == "_build":
             raise AttributeError(name)
         return getattr(self._get(), name)
 
@@ -302,6 +294,36 @@ class RealDataProvider:
         dataset = _LazyDataset(lambda: self._dataset(app))
         return assemble_app_data(app, meta, dataset, int(self.cfg.moe.routergfm.apps.max_diagnostic))
 
+    def base_graph(self, app: AppSpec):
+        """Structure-only ``Data(edge_index, num_nodes)`` of a node or link application's input graph.
+
+        Node: the full dataset graph (split- and seed-independent). Link: the
+        message-passing graph of the application's edge split (train + message
+        positives, the context the LP instances are induced on); held-out
+        val/test positives never enter.
+        """
+        from torch_geometric.data import Data
+
+        from src.data_loader.dataset_splits import _canonical_split_dataset_name, _get_or_create_edge_split_payload
+        from src.data_loader.datasets import _load_node_dataset
+
+        if app.task_level not in ("node", "edge"):
+            raise ValueError(f"{app.key}: only node and link applications have a single base graph.")
+        base = _load_node_dataset(name=app.dataset, root=self.cfg.moe.routergfm.apps.data.root, transform=None)[0]
+        edge_index = base.edge_index
+        if app.task_level == "edge":
+            payload = _get_or_create_edge_split_payload(
+                dataset_name=_canonical_split_dataset_name(app.dataset, "edge", int(app.seed)),
+                split=app.split,
+                seed=int(app.seed),
+                split_root_path=Path(self._split_root(app)),
+                data=base,
+                persist=True,
+                verbose=False,
+            )
+            edge_index = edge_index[:, torch.as_tensor(payload["context_pos_idx"], dtype=torch.long)]
+        return Data(edge_index=edge_index, num_nodes=int(base.num_nodes))
+
     # -- datasets -----------------------------------------------------------
     def _remember(self, key: str, dataset: Any) -> None:
         self._datasets[key] = dataset
@@ -318,9 +340,12 @@ class RealDataProvider:
         self._remember(key, dataset)
         return dataset
 
-    def _split_root(self) -> str:
+    def _split_root(self, app: AppSpec) -> str:
+        """Standard split root, or ``analysis.shift_root/<tag>`` for a tagged (shift) application."""
         from src.utils.dataset_helpers import shared_split_root
 
+        if app.split_root_tag:
+            return os.path.join(str(self.cfg.moe.routergfm.analysis.shift_root), app.split_root_tag)
         return str(self.cfg.moe.routergfm.apps.data.split_root or shared_split_root(self.cfg))
 
     def _create(self, app: AppSpec):
@@ -344,7 +369,7 @@ class RealDataProvider:
             edge_max_size=ds.edge_max_size,
             require_induced_cache_hit=bool(ds.require_induced_cache_hit),
             split=app.split,
-            split_root=self._split_root(),
+            split_root=self._split_root(app),
             feature_svd_dir=ds.feature_svd_dir,
             induced_root=ds.induced_root or shared_induced_root(self.cfg),
             graph_filter_dir=ds.graph_filter_dir,
@@ -375,6 +400,11 @@ class RealDataProvider:
 
         level = app.task_level
         induced = level != "graph"
+        if app.split_root_tag:
+            # A shift file that fails the loader's checks would be silently regenerated as a standard split.
+            from src.data_loader.shift_splits import verify_shift_root
+
+            verify_shift_root(self._split_root(app), [(app.dataset, level, app.seed, app.split)])
         # A fresh build: the node split is attached by create_dataset itself.
         dataset = self._create(app)
         train_loader, val_loader, test_loader = make_workflow_loaders(
@@ -387,11 +417,12 @@ class RealDataProvider:
             split=app.split,
             seed=app.seed,
             induced=induced,
-            split_root=self._split_root(),
+            split_root=self._split_root(app),
         )
         support = torch.sort(_loader_positions(train_loader)).values
         query = torch.sort(_loader_positions(test_loader)).values
-        if level != "edge" and len(val_loader.dataset) > 0:
+        # Shift split files deliberately park the unused instances in val (meta.val_semantics == 'unused').
+        if level != "edge" and len(val_loader.dataset) > 0 and not app.split_root_tag:
             raise ValueError(f"{app.key}: few-shot split {app.split} unexpectedly has validation items.")
 
         info = dataset_info(dataset=dataset, task_level=level, name=app.dataset, induced=induced)

@@ -2,7 +2,8 @@
 
 * ``L_task``: the repo's shared supervised loss on one vector per instance
   (``src.moe.shift_eval.instance_readout``: target node / endpoint Hadamard /
-  pooled graph).
+  pooled graph); regression trains on support median/MAD-normalized targets
+  (``normalizer``, set by the runner) and ``logits`` returns raw-unit outputs.
 * ``L_align`` (Eqs. 7-8): ``KL(w* || w)`` between the ORC targets and the gate,
   averaged over the nodes of the batch.
 * ``L_contr`` (Eqs. 9-10): InfoNCE with ``h_fused(v)`` as anchor, the expert
@@ -20,7 +21,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from src.moe.shift_eval import instance_readout
+from src.moe.shift_eval import instance_readout, normalized_targets, raw_outputs
 from src.utils.parsing import resolve_task_type
 from src.utils.supervised_loss import build_supervised_head, supervised_loss_from_logits
 
@@ -56,11 +57,6 @@ class GeoMoETask(nn.Module):
         g = cfg.moe.geomoe
         ds_cfg = g.dataset
         self.task_level_raw = str(ds_cfg.task_level).lower()
-        if self.task_level_raw in {"node", "edge"} and not bool(ds_cfg.induced):
-            raise ValueError(
-                "[GeoMoE] Node/edge tasks run on induced (ego / enclosing) subgraph instances; "
-                "set moe.geomoe.dataset.induced=True."
-            )
         self.task_type = resolve_task_type(getattr(ds_cfg, "task_type", None))
         self.pool_mode = str(g.graph_pooling)
         self.theta = float(g.theta)
@@ -78,14 +74,17 @@ class GeoMoETask(nn.Module):
             label_dim=int(getattr(ds_cfg, "label_dim", 1) or 1),
             num_classes=int(getattr(ds_cfg, "num_classes", 1) or 1),
         )
+        self.normalizer = None  # support RegressionNormalizer for regression (set by the runner)
 
     def parameters_to_optimize(self):
         """Head parameters; the model's parameters are added by the runner."""
         return self.parameters()
 
     def logits(self, model, data) -> torch.Tensor:
+        """Head outputs (raw target units for regression)."""
         node_repr, _ = model(data)
-        return self.classifier(instance_readout(node_repr, data, self.task_level_raw, self.pool_mode))
+        logits = self.classifier(instance_readout(node_repr, data, self.task_level_raw, self.pool_mode))
+        return raw_outputs(self.normalizer, logits)
 
     def align_loss(self, gate: torch.Tensor, kappa: torch.Tensor) -> torch.Tensor:
         """``KL(w* || w)`` averaged over nodes; ``w*`` (Eq. 7) is a constant."""
@@ -122,7 +121,9 @@ class GeoMoETask(nn.Module):
             raise ValueError("[GeoMoE] Training batches need data.node_orc (see curvature.attach_node_orc).")
         node_repr, _ = model(data)
         logits = self.classifier(instance_readout(node_repr, data, self.task_level_raw, self.pool_mode))
-        task_loss, primary = supervised_loss_from_logits(logits=logits, labels=data.y, task_type=self.task_type)
+        task_loss, primary = supervised_loss_from_logits(
+            logits=logits, labels=normalized_targets(self.normalizer, data.y), task_type=self.task_type
+        )
         kappa = kappa.to(node_repr.dtype)
         align = self.align_loss(model.last_gate, kappa)
         contr = self.contrastive_loss(node_repr, model.last_expert, kappa)

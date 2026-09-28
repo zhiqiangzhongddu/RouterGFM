@@ -1,5 +1,6 @@
 """Dataset splitting utilities for node-level, edge-level, and graph-level datasets, including support for fixed random splits, few-shot splits, and edge splits with negative sampling. Provides functions to create or load split indices and payloads, ensuring reproducibility and efficient caching of splits on disk."""
 
+import random
 import re
 from numbers import Integral
 from pathlib import Path
@@ -477,12 +478,16 @@ def _sample_unique_negative_pairs(
     collected_lo: List[int] = []
     collected_hi: List[int] = []
 
+    # PyG's sparse negative sampling draws from Python's ``random``; seed it too (and restore it)
+    # so a freshly generated split is identical in every process.
+    py_state = random.getstate()
     with torch.random.fork_rng(devices=fork_devices):
         for round_idx in range(max_rounds):
             need = num_neg_samples - len(collected_lo)
             if need <= 0:
                 break
             torch.manual_seed(int(seed) + round_idx)
+            random.seed(int(seed) + round_idx)
             neg_pairs = negative_sampling(
                 edge_index=undirected_edge_index,
                 num_nodes=num_nodes,
@@ -503,6 +508,7 @@ def _sample_unique_negative_pairs(
                 collected_hi.append(hi_v)
                 if len(collected_lo) >= num_neg_samples:
                     break
+    random.setstate(py_state)
 
     if not collected_lo:
         return torch.empty((2, 0), dtype=torch.long)

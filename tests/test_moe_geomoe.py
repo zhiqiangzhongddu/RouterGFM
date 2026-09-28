@@ -22,6 +22,8 @@ from src.moe.geomoe.model import GeoMoEModel
 from src.moe.geomoe.run import _build_task_cfg, parse_geomoe_tasks, run_geomoe
 from src.moe.geomoe.task import GeoMoETask, hard_negative_index
 from src.moe.geomoe.trainer import GeoMoERunner
+from src.moe.routergfm.common import REGRESSION
+from src.moe.shift_eval import brier_risk, normalized_targets
 
 ROOT = Path(__file__).resolve().parents[1]
 TSV_HEADER = "# dataset\ttask_level\ttask_type\tinduced\tfixed_split\tsplit_root\tskip_if_exists\n"
@@ -313,8 +315,6 @@ class ModelAndLossTest(unittest.TestCase):
         cfg = _cfg()
         cfg.moe.geomoe.dataset.induced = False
         with self.assertRaises(ValueError):
-            GeoMoETask(cfg)
-        with self.assertRaises(ValueError):
             GeoMoERunner(cfg)
 
 
@@ -343,6 +343,31 @@ class RunnerSmokeTest(unittest.TestCase):
                 self.assertIn("test_brier", ckpt["metrics"])
                 # The dataset's own instances are never annotated (ORC lives on support copies).
                 self.assertFalse(any(hasattr(g, "node_orc") for g in graphs))
+
+    def test_regression_trains_on_normalized_targets_and_reports_raw_units(self):
+        graphs, _, patcher = _patched_data("regression")
+        gen = torch.Generator().manual_seed(5)
+        for graph in graphs:
+            graph.y = 1000.0 + 100.0 * torch.randn(1, 2, generator=gen)  # QM7b-like target scale
+        seen = []
+
+        def record(normalizer, y):
+            out = normalized_targets(normalizer, y)
+            seen.append(out.detach().cpu())
+            return out
+
+        with tempfile.TemporaryDirectory() as tmp, patcher, patch("src.moe.geomoe.task.normalized_targets", record):
+            runner = GeoMoERunner(_smoke_cfg(tmp, "regression"))
+            runner.fit()
+            preds = torch.load(runner._prediction_path(), map_location="cpu")
+        self.assertTrue(seen and float(torch.cat(seen).abs().median()) < 5.0)  # unit-scale training targets
+        support = torch.cat([graph.y for graph in graphs[:8]])
+        self.assertLess(abs(float(preds["pred"].mean()) - float(support.median())), 500.0)  # raw-unit outputs
+        zero = brier_risk(
+            {"pred": torch.zeros_like(preds["pred"]), "y": preds["y"]}, task_family=REGRESSION, support_targets=support,
+        )
+        self.assertLess(runner.best_metrics["test_brier"], zero)
+        self.assertLess(runner.best_metrics["test_mae"], 500.0)
 
     def test_orc_only_for_support_instances(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(curvature, "node_orc", wraps=curvature.node_orc) as spy:

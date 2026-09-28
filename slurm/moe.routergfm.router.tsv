@@ -1,0 +1,20 @@
+# dataset	task_level	budget
+# One leave-one-dataset-out router per (target group, budget) (router.seed; router.per_seed trains per seed).
+ogbn-arxiv	node	5
+ogbn-arxiv	node	100
+photo	node	5
+photo	node	100
+airports	node	5
+airports	node	100
+chameleon	node	5
+chameleon	node	100
+dblp	edge	5
+dblp	edge	100
+cornell	edge	5
+cornell	edge	100
+qm7b	graph	5
+qm7b	graph	100
+toxcast	graph	5
+toxcast	graph	100
+mnist	graph	5
+mnist	graph	100

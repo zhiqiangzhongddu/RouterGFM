@@ -13,6 +13,7 @@ _OPERATIONAL_KEYS = {
     "checkpoint_dir",
     "log_dir",
     "num_runs",
+    "prediction_dir",
     "run_tasks_tsv",
     "skip_if_exists",
     "tasks_tsv",

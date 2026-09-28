@@ -24,9 +24,10 @@ from torch import optim
 from torch_geometric.loader import DataLoader
 
 from src.data_loader import create_dataset, dataset_info, log_split_instance_counts
+from src.data_loader.shift_splits import verify_shift_root
 from src.moe.identity import behavior_fingerprint
 from src.moe.routergfm.common import REGRESSION, infer_task_family
-from src.moe.shift_eval import brier_risk, collect_query_outputs, save_query_predictions
+from src.moe.shift_eval import brier_risk, collect_query_outputs, save_query_predictions, support_normalizer
 from src.utils.checkpoint import cfg_to_dict, save_checkpoint, save_training_log
 from src.utils.dataset_helpers import (
     is_few_shot_split,
@@ -176,14 +177,15 @@ class GeoMoERunner:
             prefix="[GeoMoE][Split]",
         )
         self._attach_support_orc()
+        task_type = resolve_task_type(getattr(ds_cfg, "task_type", None))
+        family = infer_task_family(raw_task_level, task_type, int(getattr(ds_cfg, "label_dim", 1) or 1))
+        self.task.normalizer = support_normalizer(self.train_loader.dataset, family)
 
     def _require_intact_shift_split(self, split_task_level: str) -> None:
         """Verify the shift split file before the loader could replace a missing/invalid one."""
         split_root = Path(shared_split_root(self.cfg))
         if split_root.resolve().parent != Path(str(self.cfg.data_preparation.shift.root)).resolve():
             return
-        from src.data_loader.shift_splits import verify_shift_root
-
         verify_shift_root(
             split_root, [(str(self.geo_cfg.dataset.name), split_task_level, int(self.cfg.seed), self.split)]
         )

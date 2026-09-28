@@ -10,6 +10,7 @@ from torch_geometric.data import Data
 
 from src.config import cfg as base_cfg
 from src.moe.routergfm import descriptors as desc_mod
+from src.moe.routergfm.applications import instance_set_key
 from src.moe.routergfm.archive import build_archive, build_cells, kmeans, perturb_archive
 from src.moe.routergfm.common import GRAPH_CLS, LINK, NODE_CLS, REGRESSION, TASK_FAMILIES, AppSpec, CompatKey, RouterPaths
 from src.moe.routergfm.descriptors import (
@@ -185,13 +186,28 @@ def test_batched_equals_single_and_featureless(monkeypatch):
     assert torch.isfinite(z).all() and z[family_slices(K)["feature"]].abs().sum() == 0
 
 
+def _best_time(fn, repeats=3):
+    best = float("inf")
+    for _ in range(repeats):
+        start = time.perf_counter()
+        fn()
+        best = min(best, time.perf_counter() - start)
+    return best
+
+
 def test_descriptors_are_fast():
+    """Vectorized: timed against the batched eigendecompositions it needs anyway.
+
+    Host load slows both alike, so the ratio (~4 idle; ~15 for a per-instance
+    loop) is stable where a wall-clock bound flakes on shared login nodes.
+    """
     graphs = [_random_graph(60, seed=s, p=0.1, feat_dim=100) for s in range(256)]
+    gen = torch.Generator().manual_seed(0)
+    sym = torch.randn(len(graphs), 60, 60, generator=gen, dtype=torch.float64)
+    sym = sym @ sym.transpose(1, 2)
     batch_descriptors(graphs[:8], "edge", LINK)  # warm-up
-    start = time.perf_counter()
-    batch_descriptors(graphs, "edge", LINK)
-    per_graph = (time.perf_counter() - start) / len(graphs)
-    assert per_graph < 2e-3, f"{per_graph * 1e3:.2f} ms per 60-node subgraph"
+    ratio = _best_time(lambda: batch_descriptors(graphs, "edge", LINK)) / _best_time(lambda: torch.linalg.eigvalsh(sym))
+    assert ratio < 10, f"descriptors take {ratio:.1f}x one batched 60x60 eigvalsh"
 
 
 def _app_data(n=10, seed=42):
@@ -228,7 +244,8 @@ def test_ensure_descriptors_cache(tmp_path):
     assert torch.equal(cache["positions"], torch.tensor([0, 1, 3, 5, 7, 8]))
     assert cache["z"].shape == (6, len(NAMES))
     assert torch.allclose(cache["z"], compute_descriptors(data, cache["positions"], cfg, device="cpu"), atol=1e-6)
-    assert RouterPaths.from_cfg(cfg).descriptor_file(data.app.data_key).exists()
+    assert cache["data_keys"] == [data.app.data_key]
+    assert RouterPaths.from_cfg(cfg).descriptor_file(instance_set_key(data.app)).exists()
 
     again = ensure_descriptors(cfg, data.app, _NoProvider())
     assert torch.equal(again["z"], cache["z"])
@@ -246,6 +263,46 @@ def test_ensure_descriptors_cache(tmp_path):
     assert provider.calls == 1 and torch.equal(fresh["positions"], extended["positions"])
     stale = ensure_descriptors(_cfg(tmp_path, num_spectral=2), data.app, provider)  # layout changed -> rebuilt
     assert provider.calls == 2 and stale["z"].shape[1] == len(descriptor_names(2))
+
+
+def test_descriptor_cache_is_shared_per_instance_set(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    paths = RouterPaths.from_cfg(cfg)
+    first = _app_data()
+    ensure_descriptors(cfg, first)
+    computed = []
+    compute = desc_mod.compute_descriptors
+    monkeypatch.setattr(desc_mod, "compute_descriptors", lambda d, pos, c: computed.extend(pos.tolist()) or compute(d, pos, c))
+
+    # Another budget/seed of the same node dataset: one file, only the new positions computed.
+    other = _app_data()
+    other.app = AppSpec("toy", "node", 100, 0)
+    other.query_pos = torch.tensor([3, 5, 8, 0, 2, 9])
+    provider = _Provider(other)
+    assert ensure_descriptors(cfg, other.app, provider)["data_keys"] == sorted([first.app.data_key, other.app.data_key])
+    assert provider.calls == 1 and computed == [2, 9]
+    assert sorted(p.parent.name for p in (paths.root / "data").glob("*/descriptors.pt")) == ["toy__node"]
+    both = ensure_descriptors(cfg, first.app, _NoProvider())  # covered data keys are served without loading
+    assert torch.equal(both["positions"], torch.tensor([0, 1, 2, 3, 5, 7, 8, 9]))
+    assert torch.equal(ensure_descriptors(cfg, other.app, _NoProvider())["z"], both["z"])
+
+    # A shift-tagged node application reuses the instance set: nothing is recomputed.
+    tagged = _app_data()
+    tagged.app = AppSpec("toy", "node", 5, 42, split_root_tag="structural")
+    assert tagged.app.data_key != first.app.data_key and instance_set_key(tagged.app) == "toy__node"
+    assert tagged.app.data_key in ensure_descriptors(cfg, tagged)["data_keys"]
+    assert computed == [2, 9]
+
+    # LP instance sets are built per edge split: separate caches, tagged or not.
+    lp = [AppSpec("toy", "edge", 5, 42), AppSpec("toy", "edge", 5, 42, split_root_tag="structural")]
+    for app in lp:
+        data = _app_data()
+        data.app, data.level, data.task_family = app, "edge", LINK
+        ensure_descriptors(cfg, data)
+    assert instance_set_key(lp[0]) != instance_set_key(lp[1])
+    for app in lp:
+        assert paths.descriptor_file(instance_set_key(app)).is_file()
+        assert ensure_descriptors(cfg, app, _NoProvider())["data_keys"] == [app.data_key]
 
 
 def test_standardizer():

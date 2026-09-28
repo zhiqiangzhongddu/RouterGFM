@@ -17,7 +17,7 @@ from src.moe.routergfm.router.trainer import (
     BUNDLE_FILE,
     LOG_FILE,
     RouterTrainer,
-    _validation_groups,
+    validation_groups,
     build_router_trainer,
     router_run_key,
     train_router,
@@ -59,7 +59,7 @@ def fitted(env):
     trainer = build_router_trainer(env.cfg, TARGET, BUDGET, env.provider)
     before = {"val": trainer.evaluate()["loss"], "train": _train_objective(trainer)}
     trainer.fit()
-    trainer.select_rho_tau()
+    trainer.select_integration_params()
     return SimpleNamespace(trainer=trainer, before=before)
 
 
@@ -87,6 +87,23 @@ def test_target_group_never_enters_training_validation_graph_or_archive(fitted):
     assert tr.meta["run_key"] == router_run_key(TARGET, BUDGET, 42)
 
 
+def test_excluded_experts_leave_the_catalog_graph_and_archive_only(env, fitted):
+    full = fitted.trainer
+    arch = full.catalog[0].architecture
+    hidden = [s.expert_id for s in full.catalog if s.architecture == arch]
+    tr = build_router_trainer(env.cfg, TARGET, BUDGET, env.provider, exclude_experts=hidden)
+    assert [s.expert_id for s in tr.catalog] == [s.expert_id for s in full.catalog if s.expert_id not in hidden]
+    assert not set(hidden) & set(tr.graph.expert_ids) and arch not in tr.graph.arch_names
+    assert not {tr.catalog[e].expert_id for e in tr.archive.expert.tolist()} & set(hidden)
+    assert len(tr.archive) < len(full.archive) and tr.meta["hidden_experts"] == sorted(hidden)
+    # Same applications, validation groups, and descriptor standardizer as the full-catalog router.
+    assert [a.key for a in tr.apps_train] == [a.key for a in full.apps_train]
+    assert [a.key for a in tr.apps_val] == [a.key for a in full.apps_val]
+    assert [a.key for a in tr.archive.apps] == [a.key for a in full.archive.apps]
+    assert tr.meta["val_groups"] == full.meta["val_groups"] and "hidden_experts" not in full.meta
+    assert torch.equal(tr.standardizer.mean, full.standardizer.mean) and torch.equal(tr.standardizer.std, full.standardizer.std)
+
+
 def test_validation_group_choice():
     apps = [
         AppSpec("cora", "edge", 5, 0),
@@ -96,15 +113,17 @@ def test_validation_group_choice():
     ]
     fam = dict(zip([a.key for a in apps], [LINK, NODE_CLS, NODE_CLS, REGRESSION]))
     cfg = lambda num=1, names=(): SimpleNamespace(num_val_datasets=num, val_datasets=list(names))  # noqa: E731
-    assert _validation_groups(cfg(1), "tgt", apps, fam, {NODE_CLS}) == ["pubmed"]
-    assert _validation_groups(cfg(2), "tgt", apps, fam, {NODE_CLS}) == ["pubmed", "photo"]
-    assert _validation_groups(cfg(1), "tgt", apps, fam, {REGRESSION}) == ["qm9"]
-    assert _validation_groups(cfg(1), "tgt", apps, fam, set()) == ["cora"]
-    assert _validation_groups(cfg(1, ["Photo:node", "tgt"]), "tgt", apps, fam, {LINK}) == ["photo"]
+    assert validation_groups(cfg(1), "tgt", apps, fam, {NODE_CLS}) == ["pubmed"]
+    # Never the last training group of a target family: photo stays for NODE_CLS, qm9 for REGRESSION.
+    assert validation_groups(cfg(2), "tgt", apps, fam, {NODE_CLS}) == ["pubmed", "cora"]
+    assert validation_groups(cfg(1), "tgt", apps, fam, {REGRESSION}) == ["cora"]
+    assert validation_groups(cfg(4), "tgt", apps, fam, {NODE_CLS}) == ["pubmed", "cora", "qm9"]
+    assert validation_groups(cfg(1), "tgt", apps, fam, set()) == ["cora"]
+    assert validation_groups(cfg(1, ["Photo:node", "tgt"]), "tgt", apps, fam, {LINK}) == ["photo"]
     with pytest.raises(ValueError):
-        _validation_groups(cfg(1, ["unknown"]), "tgt", apps, fam, {NODE_CLS})
+        validation_groups(cfg(1, ["unknown"]), "tgt", apps, fam, {NODE_CLS})
     with pytest.raises(ValueError):
-        _validation_groups(cfg(4), "tgt", apps, fam, {NODE_CLS})  # nothing left for training
+        validation_groups(cfg(4, ["cora", "pubmed", "photo", "qm9"]), "tgt", apps, fam, {NODE_CLS})  # nothing left for training
 
 
 # --------------------------------------------------------------------------- #
@@ -193,16 +212,17 @@ def test_early_stopping(env):
 
 
 # --------------------------------------------------------------------------- #
-# rho / tau
+# rho / tau / bandwidth
 # --------------------------------------------------------------------------- #
-def test_rho_tau_grid_selection_uses_stored_predictions_and_mixture_loss(env, fitted):
+def test_integration_grid_selection_uses_stored_predictions_and_mixture_loss(env, fitted):
     tr = fitted.trainer
-    grid = tr.log["rho_tau_grid"]
+    grid = tr.log["integration_grid"]
     rt = tr.rt
-    assert len(grid) == len(rt.rho_grid) * len(rt.tau_grid)
+    assert len(grid) == len(rt.bandwidth_grid) * len(rt.rho_grid) * len(rt.tau_grid)
     best = min(grid, key=lambda row: row["risk"])
-    assert (tr.rho, tr.tau) == (best["rho"], best["tau"])
-    # rho = 0 is application-level (global) weighting of the top-K team's stored D_v predictions.
+    assert (tr.rho, tr.tau, tr.bandwidth) == (best["rho"], best["tau"], best["bandwidth"])
+    assert tr.bandwidth in rt.bandwidth_grid and tr.log["bandwidth"] == tr.bandwidth
+    # rho = 0 is application-level (global) weighting of the top-K team's stored D_v predictions, for every h.
     for tau in rt.tau_grid:
         risks = []
         for app in tr.apps_val:
@@ -214,18 +234,49 @@ def test_rho_tau_grid_selection_uses_stored_predictions_and_mixture_loss(env, fi
             data = env.provider.load(app)
             loss = instance_losses(env.cfg, mixed, data.labels["diag"], data.task_family, app_normalizer(env.cfg, data))
             risks.append(loss[torch.isfinite(loss)].mean())
-        row = next(r for r in grid if r["rho"] == 0.0 and r["tau"] == tau)
-        assert row["risk"] == pytest.approx(float(torch.stack(risks).mean()), rel=1e-5)
+        rows = [r for r in grid if r["rho"] == 0.0 and r["tau"] == tau]
+        assert len(rows) == len(rt.bandwidth_grid)
+        for row in rows:
+            assert row["risk"] == pytest.approx(float(torch.stack(risks).mean()), rel=1e-5)
 
 
-def test_configured_rho_tau_skip_selection(env):
+def test_bandwidth_is_selected_jointly_with_one_search_per_validation_app(env, fitted, monkeypatch):
+    """h changes the kernel weights only: one top-J search per validation application serves the whole grid,
+    and the risk surface is exactly that of each h evaluated on its own."""
+    grid = [0.05, 0.3, 1.0]
+    tr = build_router_trainer(_cfg(env, bandwidth_grid=grid, rho=1.0, tau=0.05), TARGET, BUDGET, env.provider)
+    tr.model.load_state_dict(fitted.trainer.model.state_dict())
+    calls, search = [], trainer_mod.search
+    monkeypatch.setattr(trainer_mod, "search", lambda *a, **k: calls.append(1) or search(*a, **k))
+    rho, tau, h = tr.select_integration_params()
+    assert len(calls) == len(tr.apps_val) and (rho, tau) == (1.0, 0.05) and h in grid
+    risks = {row["bandwidth"]: row["risk"] for row in tr.log["integration_grid"]}
+    assert h == min(grid, key=lambda b: (risks[b], grid.index(b)))
+    monkeypatch.setattr(trainer_mod, "search", search)
+    for b in grid:
+        single = build_router_trainer(
+            _cfg(env, select_bandwidth=False, bandwidth=b, rho=1.0, tau=0.05), TARGET, BUDGET, env.provider
+        )
+        single.model.load_state_dict(fitted.trainer.model.state_dict())
+        single.model.eval()
+        keys = single._record_keys()
+        alone = torch.stack([single._mixture_risks(ep, [b], [1.0], [0.05], keys) for ep in single._val]).mean()
+        assert risks[b] == pytest.approx(float(alone), rel=1e-6)
+    assert len(set(risks.values())) > 1  # h matters once the correction is on (rho = 1)
+
+
+def test_configured_integration_params_skip_selection(env):
+    tr = build_router_trainer(_cfg(env, rho=0.5, tau=0.1, select_bandwidth=False), TARGET, BUDGET, env.provider)
+    tr.provider = None  # no labels needed when all three are configured
+    assert tr.select_integration_params() == (0.5, 0.1, float(tr.rt.bandwidth))
     tr = build_router_trainer(_cfg(env, rho=0.5, tau=0.1), TARGET, BUDGET, env.provider)
-    tr.provider = None  # no labels needed when both are configured
-    assert tr.select_rho_tau() == (0.5, 0.1)
-    tr = build_router_trainer(_cfg(env, rho=0.5), TARGET, BUDGET, env.provider)
     tr.provider = None
     with pytest.raises(ValueError):
-        tr.select_rho_tau()  # tau still needs the validation grid
+        tr.select_integration_params()  # the bandwidth still needs the validation grid
+    tr = build_router_trainer(_cfg(env, rho=0.5, select_bandwidth=False), TARGET, BUDGET, env.provider)
+    tr.provider = None
+    with pytest.raises(ValueError):
+        tr.select_integration_params()  # tau still needs the validation grid
     with pytest.raises(RuntimeError):
         tr.save(env.cfg.moe.routergfm.output_root)
 
@@ -238,7 +289,7 @@ def test_bundle_round_trip_reproduces_mu_hat(env, fitted, tmp_path):
     directory = tr.save(tmp_path / "router")
     assert (directory / BUNDLE_FILE).is_file() and (directory / LOG_FILE).is_file()
     bundle = RouterTrainer.load(directory, env.cfg, device="cpu")
-    assert (bundle.rho, bundle.tau) == (tr.rho, tr.tau)
+    assert (bundle.rho, bundle.tau, bundle.bandwidth) == (tr.rho, tr.tau, tr.bandwidth)
     assert bundle.catalog_ids == [s.expert_id for s in tr.catalog]
     assert bundle.train_apps == tr.apps_train and bundle.val_apps == tr.apps_val
     assert bundle.graph_apps == [n for n in tr.graph.app_nodes if isinstance(n, AppSpec)]
@@ -274,7 +325,8 @@ def test_train_router_writes_bundle_and_reuses_it(env, monkeypatch):
     assert bundle.meta["target_group"] == TARGET and bundle.meta["budget"] == BUDGET
     for apps in (bundle.train_apps, bundle.val_apps, bundle.graph_apps, bundle.archive_apps):
         assert apps and TARGET not in _groups(apps)
-    assert bundle.rho in cfg.moe.routergfm.router.rho_grid and bundle.tau in cfg.moe.routergfm.router.tau_grid
+    rt = cfg.moe.routergfm.router
+    assert bundle.rho in rt.rho_grid and bundle.tau in rt.tau_grid and bundle.bandwidth in rt.bandwidth_grid
     assert len(bundle.log["epochs"]) == 2
 
     def _fail(*args, **kwargs):
@@ -283,4 +335,21 @@ def test_train_router_writes_bundle_and_reuses_it(env, monkeypatch):
     monkeypatch.setattr(trainer_mod, "build_router_trainer", _fail)
     stamp = (path / BUNDLE_FILE).stat().st_mtime_ns
     assert train_router(cfg, TARGET, BUDGET, env.provider) == path
+    assert (path / BUNDLE_FILE).stat().st_mtime_ns == stamp
+
+    # Bookkeeping and deploy-time keys do not invalidate the bundle ...
+    same = cfg.clone()
+    same.moe.routergfm.router.per_seed = True
+    same.moe.routergfm.archive.perturbation, same.moe.routergfm.archive.perturbation_seed = "shuffled", 3
+    assert train_router(same, TARGET, BUDGET, env.provider, seed=42) == path
+    # ... a changed router config is refused instead of being reused under the new config's hash ...
+    for block, key, value in (("router", "topk", 1), ("router", "epochs", 3), ("archive", "num_cells", 2)):
+        other = cfg.clone()
+        setattr(other.moe.routergfm[block], key, value)
+        with pytest.raises(ValueError, match="another config"):
+            train_router(other, TARGET, BUDGET, env.provider)
+    # ... and skip_if_exists False retrains.
+    cfg.moe.routergfm.router.skip_if_exists = False
+    with pytest.raises(AssertionError, match="retrained"):
+        train_router(cfg, TARGET, BUDGET, env.provider)
     assert (path / BUNDLE_FILE).stat().st_mtime_ns == stamp

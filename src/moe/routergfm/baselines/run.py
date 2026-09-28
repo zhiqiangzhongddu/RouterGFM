@@ -8,7 +8,9 @@ prints a summary, and appends one row to ``outputs/results/moe_<method>.tsv``.
 Link prediction runs once per dataset: both budget blocks share one edge split
 and report shared results (App. B.3). Per-seed metrics are cached under
 ``baselines.output_dir/<method>/<fingerprint>/<app.key>.json`` and reused when
-``baselines.skip_if_exists``.
+``baselines.skip_if_exists``. The fingerprint and the result-row identity cover
+every config the method reads: its ``baselines.<block>`` and
+:data:`CONFIG_DEPENDENCIES`.
 """
 
 from __future__ import annotations
@@ -22,7 +24,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 from yacs.config import CfgNode as CN
 
 from src.moe.identity import behavior_fingerprint
-from src.utils.checkpoint import save_json_atomic
+from src.utils.checkpoint import cfg_to_dict, save_json_atomic
 from src.utils.random import set_seed
 from src.utils.run_helpers import aggregate_run_metrics, should_include_summary_metric, summarize_runs
 from src.utils.save_results import append_workflow_result, get_explicit_cfg_keys, set_explicit_cfg_keys
@@ -34,7 +36,7 @@ from . import BASELINE_RUNNERS, config_block_name, load_runner_class
 _LOG = "[RouterGFM][baselines]"
 _TSV_COLUMNS = {"method", "dataset", "task_level", "budget"}
 _REQUIRED_COLUMNS = ("dataset", "task_level", "budget")
-# Result-table identity columns shared by every matched-pool row (plus the method's own subtree).
+# Result-table identity columns shared by every matched-pool row (plus the method's identity_paths).
 _IDENTITY_KEYS = [
     "moe.method",
     "moe.routergfm.baselines.method",
@@ -44,6 +46,25 @@ _IDENTITY_KEYS = [
     "moe.routergfm.baselines.candidate_rule",
     "moe.routergfm.baselines.candidate_pool",
 ]
+# Per-row temp TSVs of the SLURM launchers: routing only, never a result-table column.
+_ROUTING_KEYS = {"moe.routergfm.baselines.run_tasks_tsv", "moe.routergfm.baselines.tasks_tsv"}
+# Config a method reads outside its own ``baselines.<block>`` (paths below ``cfg.moe.routergfm``;
+# ``output_root``, i.e. history, embeddings and descriptors, is always fingerprinted). Editing any of
+# them re-runs the method instead of reusing its cached results.
+CONFIG_DEPENDENCIES: Dict[str, Tuple[str, ...]] = {
+    "metagl_u": ("baselines.metagl", "graph", "heads"),  # MetaGL(+metadata) team; its fitted heads
+    "meta_des": ("descriptors", "heads"),  # competence region in z(x); OOF and query heads
+    "kdem": ("heads.type", "heads.hidden_dim"),  # the new task head
+    "ppem": ("heads.type", "heads.hidden_dim"),
+    "metadata_mlp": ("graph",),  # text / numeric metadata blocks
+    "nearest_application": ("graph",),
+    "metagl_metadata": ("graph",),
+    "model_spider": ("descriptors", "router.val_datasets", "router.num_val_datasets"),
+}
+# Keys of a shared block that only the sibling variant reads (or that never change results), kept out of
+# the method's identity: PPEM's ``ema`` never invalidates KDEM results, KDEM's ``kd`` never invalidates
+# PPEM results, and ``num_workers`` invalidates neither.
+_UNUSED_BLOCK_KEYS: Dict[str, Tuple[str, ...]] = {"kdem": ("ema", "num_workers"), "ppem": ("kd", "num_workers")}
 
 
 # --------------------------------------------------------------------------- #
@@ -116,12 +137,39 @@ def method_config(cfg, block_name: str) -> CN:
     return block if isinstance(block, CN) else CN()
 
 
+def config_value(cfg, path: str) -> Any:
+    """Plain (JSON-ready) value of ``cfg.moe.routergfm.<path>``; None when absent."""
+    node = cfg.moe.routergfm
+    for part in path.split("."):
+        node = node.get(part) if isinstance(node, dict) else None
+    return cfg_to_dict(node) if isinstance(node, dict) else node
+
+
+def identity_paths(cfg, method: str, block_name: str) -> List[str]:
+    """Config paths below ``cfg.moe.routergfm`` that define *method*'s results: its block (the keys
+    it reads, when it shares the block with a sibling variant) and :data:`CONFIG_DEPENDENCIES`."""
+    block, unused = method_config(cfg, block_name), _UNUSED_BLOCK_KEYS.get(method, ())
+    if not block:
+        own = []
+    elif unused:
+        own = [f"baselines.{block_name}.{key}" for key in block if key not in unused]
+    else:
+        own = [f"baselines.{block_name}"]
+    return own + list(CONFIG_DEPENDENCIES.get(method, ()))
+
+
 def result_dir(cfg, method: str, block_name: str, external: Mapping[str, Any]) -> Path:
-    """``baselines.output_dir/<method>/<fingerprint>``: the fingerprint covers the method subtree,
-    ``output_root`` (history, heads), and the caller's shared behavior keys."""
+    """``baselines.output_dir/<method>/<fingerprint>``: the fingerprint covers the method subtree
+    (minus its sibling variant's keys), its :data:`CONFIG_DEPENDENCIES`, ``output_root`` (history,
+    heads), and the caller's shared behavior keys."""
     rg = cfg.moe.routergfm
+    unused = _UNUSED_BLOCK_KEYS.get(method, ())
+    block = {k: v for k, v in cfg_to_dict(method_config(cfg, block_name)).items() if k not in unused}
     payload = {"method": method, "output_root": str(rg.output_root), **dict(external)}
-    fingerprint = behavior_fingerprint(method_config(cfg, block_name), external_behavior=payload)
+    dependencies = {path: config_value(cfg, path) for path in CONFIG_DEPENDENCIES.get(method, ())}
+    if dependencies:
+        payload["dependencies"] = dependencies
+    fingerprint = behavior_fingerprint(block, external_behavior=payload)
     return Path(str(rg.baselines.output_dir)) / method / fingerprint
 
 
@@ -155,10 +203,8 @@ def _task_cfg(cfg, method: str, spec: str, budget: int):
     b.datasets = [spec]
     b.budgets = [int(budget)]
     b.run_tasks_tsv = False
-    keys = get_explicit_cfg_keys(cfg) + _IDENTITY_KEYS
-    block = config_block_name(method)
-    if block in b:
-        keys.append(f"moe.routergfm.baselines.{block}")
+    keys = [k for k in get_explicit_cfg_keys(cfg) if k not in _ROUTING_KEYS] + _IDENTITY_KEYS
+    keys += [f"moe.routergfm.{path}" for path in identity_paths(cfg, method, config_block_name(method))]
     set_explicit_cfg_keys(run_cfg, keys)
     return run_cfg
 
@@ -256,8 +302,11 @@ def run_matched_baseline_from_cfg(cfg, *, infra=None) -> int:
 
 
 __all__ = [
+    "CONFIG_DEPENDENCIES",
     "baseline_seeds",
     "baseline_tasks",
+    "config_value",
+    "identity_paths",
     "method_config",
     "parse_baseline_tasks",
     "result_dir",

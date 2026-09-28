@@ -56,8 +56,8 @@ pip install -r requirements.txt
 pytest -q
 ```
 
-The SLURM launchers source `slurm/_common.sh`, which activates `${CONDA_ENV}` under `${CONDA_BASE}`. Override both
-variables to match your cluster.
+The SLURM launchers source `slurm/_common.sh`, which activates `${CONDA_ENV}` (default `agae`) under `${CONDA_BASE}`.
+Override both variables to match your cluster.
 
 ## Datasets
 
@@ -168,35 +168,49 @@ python scripts/run_moe.py \
 sbatch slurm/moe.gmoe.slurm   # one launcher + TSV grid per method
 ```
 
-**Matched-pool methods** (`src/moe/routergfm/baselines`) use the same expert inventory, fitted heads, and support
-observations as RouterGFM:
+**Matched-pool methods** (`src/moe/routergfm/baselines`) use the same expert inventory and support observations as
+RouterGFM (and, except KDEM/PPEM, its fitted heads):
 
 - *Application-level selection:* metadata MLP, nearest application, MetaGL, MetaGL+metadata, LogME, Model Spider.
-- *Frozen-expert mixtures:* SAGMM-PE, MetaGL-U, META-DES, and KDEM/PPEM (expert merging over compatible architectures).
+- *Frozen-expert mixtures:* SAGMM-PE, MetaGL-U, META-DES.
+- *Expert merging:* KDEM/PPEM (compatible architectures; merged experts and a new head fine-tuned on `S_a`).
 - *Fixed-team integration rules on the same team and predictions:* uniform, global risk weights (RouterGFM-G),
   simplex stacking, Local-MLP, and the no-centering and shuffled-record controls.
+
+Run them with `moe.routergfm.task matched_baseline|selection_baseline moe.routergfm.baselines.method <name>`, or with
+`sbatch slurm/moe.routergfm_baselines.slurm` / `slurm/moe.routergfm_selection.slurm`.
 
 ## RouterGFM
 
 The pipeline follows Algorithm 1 of the paper and runs as stages of `moe.method routergfm`, selected by
-`moe.routergfm.task`. All artifacts are written below `outputs/routergfm/`.
+`moe.routergfm.task`. All artifacts are written below `outputs/routergfm/`. Historical applications are the 9 targets
+plus the source corpora listed in `moe.routergfm.apps.history_extra`. Experts are never evaluated on their own source
+dataset.
+
+**Before a full run.** The expert catalog reads `moe.routergfm.experts.checkpoint_root`. The applications read the
+prepared data configured under `moe.routergfm.apps.data`. Run data preparation for every dataset in
+`moe.routergfm.apps.history_extra` so that its induced-subgraph caches and link-prediction splits exist.
 
 1. **Historical evaluations** (`history`). For each historical application, fit expert task heads on `S_b` with frozen
    encoders. Record per-instance routing losses on a disjoint diagnostic set `D_b`, together with the label-free
-   context descriptors `z(x)`. Shard the work over the expert pool:
+   context descriptors `z(x)`. Work is sharded over the expert pool. Existing records are skipped, so failed shards can
+   be resubmitted:
 
    ```bash
    python scripts/run_moe.py \
      moe.method routergfm \
      moe.routergfm.task history \
      moe.routergfm.experts.shard_index 0 \
-     moe.routergfm.experts.num_shards 16 \
+     moe.routergfm.experts.num_shards 48 \
      device 0
+
+   sbatch slurm/moe.routergfm.history.slurm   # one array element per shard
    ```
 
 2. **Router training** (`router`). Build the context graph and the local archive, then train the shared scorer and the
-   retrieval keys with application-masked episodes (Huber + ListMLE + local squared loss). The target dataset's group
-   is always held out, and `rho` and `tau` are selected on validation applications:
+   retrieval keys with application-masked episodes (Huber + ListMLE + local squared loss). There is one
+   leave-one-dataset-out router per (target, budget). Validation applications (grouped by base dataset) select the
+   checkpoint, then `rho`, `tau` and the retrieval bandwidth `h`:
 
    ```bash
    python scripts/run_moe.py \
@@ -205,12 +219,16 @@ The pipeline follows Algorithm 1 of the paper and runs as stages of `moe.method 
      moe.routergfm.deploy.target photo:node \
      moe.routergfm.deploy.budget 5 \
      device 0
+
+   sbatch slurm/moe.routergfm.router.slurm   # rows in slurm/moe.routergfm.router.tsv
    ```
 
 3. **Deployment and benchmark** (`deploy`, `benchmark`). Select the team without executing candidates, fit its heads
    once on `S_a`, and predict `Q_a` with context-dependent weights. `benchmark` repeats this over seeds and appends
-   mean ± std rows to `outputs/results/moe_routergfm.tsv`. Rows are written for RouterGFM, RouterGFM-G, the fixed-team
-   rules, and any requested matched-pool baselines:
+   mean ± std rows to `outputs/results/moe_routergfm.tsv` for RouterGFM, RouterGFM-G (`routergfm_g`) and the
+   fixed-team rules (`fixed_team:<rule>`). Matched-pool baselines added to `moe.routergfm.benchmark.methods`
+   (e.g. `"['routergfm','sagmm_pe']"`) run on the same tasks and seeds and append to
+   `outputs/results/moe_<method>.tsv`:
 
    ```bash
    python scripts/run_moe.py \
@@ -219,22 +237,29 @@ The pipeline follows Algorithm 1 of the paper and runs as stages of `moe.method 
      moe.routergfm.benchmark.run_tasks_tsv True \
      moe.routergfm.benchmark.tasks_tsv slurm/moe.routergfm.tsv \
      device 0
+
+   sbatch slurm/moe.routergfm.benchmark.slurm
    ```
 
-4. **Analyses** (`analysis`). `moe.routergfm.analysis.kind` selects one of:
-   - `insertion`: new application, new configuration, unseen architecture, joint novelty;
-   - `calibration`: source calibration of a new expert;
-   - `team_size`: team size `K` against expert coverage;
-   - `archive_reliability`: missing cells, missing context family, reversed residuals;
-   - `specialization`: specialization conditions;
-   - `shift`: distribution-shift conditions.
+4. **Analyses** (`analysis`). `moe.routergfm.analysis.kind` selects one of the following. Rows are appended to
+   `outputs/results/moe_routergfm_analysis.tsv`, and `sbatch slurm/moe.routergfm.analysis.slurm` runs the full grid.
+   - `insertion`: new application, new configuration, unseen architecture, joint novelty (Table 10).
+   - `calibration`: source calibration of an inserted expert (Table 11).
+   - `team_size`: team size `K` against local-winner coverage (Table 12).
+   - `archive_reliability`: missing cells, missing context family, reversed residuals (Table 13).
+   - `specialization`: low / medium / high specialization (Table 14).
+   - `shift`: feature / structural / mixed shift (Table 15). Build the shift splits first:
+     `python scripts/run_data_preparation.py data_preparation.target_datasets <datasets> data_preparation.shift.build True`.
+     The paper does not specify its shift construction, so these conditions follow our own protocol in
+     `src/data_loader/shift_splits.py`.
 
 Reported metrics:
 
 - Accuracy for single-label classification.
 - ROC-AUC for link prediction and ToxCast.
 - Raw-unit MAE for QM7b.
-- Brier-type routing risk, worst-cell risk, Hit@K, and Regret@K for the diagnostics.
+- Brier-type routing risk, worst-cell risk, local-winner coverage and agreement, Hit@K, and Regret@K for the
+  diagnostics.
 
 ## Tests
 

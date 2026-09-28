@@ -331,6 +331,24 @@ def test_featureless_dataset_skips_feature_condition(tmp_path):
     assert torch.load(path, weights_only=False)["meta"]["feature_statistic_is_structural"] is True
 
 
+def test_verify_stage_skips_the_feature_condition_of_featureless_datasets(tmp_path, monkeypatch):
+    source = ss.make_shift_source(_graph_dataset("cls", cls=FeaturelessGraphList), "fl", "graph", induced=False)
+    cfg = _cfg(tmp_path)
+    cfg.seeds = [0]
+    cfg.data_preparation.dataset.num_splits = 1
+    cfg.data_preparation.graph_task_splits = [(5, 0.0, 1.0)]
+    cfg.data_preparation.target_datasets = "fl"
+    cfg.data_preparation.task_level_override = "graph"
+    cfg.data_preparation.shift.build = True
+    cfg.data_preparation.shift.verify = True
+    monkeypatch.setattr(ss, "load_shift_source", lambda *_: source)
+    assert ss.run_shift_preparation(cfg) == 0
+    built = {p.relative_to(tmp_path / "shift").parts[0] for p in (tmp_path / "shift").rglob("*.pt")}
+    assert built == set(ss.SHIFT_CONDITIONS) - {"feature"}
+    cfg.data_preparation.shift.build = False
+    (tmp_path / "shift" / "mixed" / "fl" / "fl_graph_seed0_splits-5-0-100.pt").unlink()
+    assert ss.run_shift_preparation(cfg) == 1  # other conditions are still verified
+
 def test_unsupported_inputs_raise(tmp_path, node_setup):
     _, _, source = node_setup
     cfg = _cfg(tmp_path)

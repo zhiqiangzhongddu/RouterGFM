@@ -139,7 +139,7 @@ def merge_loss(
     task_loss, _ = supervised_loss_from_logits(logits=model.combine(logits, gate), labels=inst.y, task_type=task_type)
     r_gate = cv_squared(gate.sum(dim=0))
     expert_loss = sum(
-        supervised_loss_from_logits(logits=logits[:, j], labels=inst.y, task_type=task_type)[0]
+        supervised_loss_from_logits(logits=logits[:, j].contiguous(), labels=inst.y, task_type=task_type)[0]
         for j in range(logits.size(1))
     )
     r_mask = expert_loss + mask_regularizer([head.mask_tensors() for head in model.heads], gamma_p, gamma_v)

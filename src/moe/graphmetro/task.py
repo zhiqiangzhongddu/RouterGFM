@@ -11,7 +11,9 @@ replacement from the training list (official ``train_moe.py``). For each shift
 
 The step loss is the mean of ``L1 + L2`` over the sampled shifts. Evaluation
 runs the model on the untransformed queries. The task loss is the repo's shared
-supervised loss (CE / single-logit BCE / masked multi-task BCE / MSE).
+supervised loss (CE / single-logit BCE / masked multi-task BCE / MSE); regression
+trains on support median/MAD-normalized targets (``normalizer``, set by the
+runner) and evaluates raw-unit outputs.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from src.moe.shift_eval import normalized_targets, raw_outputs
 from src.utils.parsing import resolve_task_type
 from src.utils.supervised_loss import supervised_loss_from_logits
 
@@ -49,6 +52,7 @@ class GraphMETROTask(nn.Module):
         self.align_lambda = float(gm_cfg.align_lambda)
         # Shift sampling and transforms draw from their own seeded stream.
         self.generator = torch.Generator().manual_seed(int(cfg.seed))
+        self.normalizer = None  # support RegressionNormalizer for regression (set by the runner)
 
     def parameters_to_optimize(self):
         """No task-owned parameters: the classifier head lives in the model (own LR group)."""
@@ -83,7 +87,7 @@ class GraphMETROTask(nn.Module):
         loss = 0.0
         sums = {"gate": 0.0, "task": 0.0, "align": 0.0, "primary": 0.0, "gate_acc": 0.0}
         for idx, batch in zip(chosen, shifted):
-            terms = self.shift_terms(model, batch.to(device), idx, z0, clean.y)
+            terms = self.shift_terms(model, batch.to(device), idx, z0, normalized_targets(self.normalizer, clean.y))
             loss = loss + terms["gate"] + terms["task"] + self.align_lambda * terms["align"]
             for key in sums:
                 sums[key] += float(terms[key])
@@ -102,7 +106,8 @@ class GraphMETROTask(nn.Module):
         data = data.to(device)
         logits, _ = model(data)
         return supervised_loss_from_logits(
-            logits=logits, labels=data.y, task_type=self.task_type, return_outputs=return_outputs,
+            logits=raw_outputs(self.normalizer, logits), labels=data.y, task_type=self.task_type,
+            return_outputs=return_outputs,
         )
 
 

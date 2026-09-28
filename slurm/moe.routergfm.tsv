@@ -1,0 +1,21 @@
+# dataset	task_level	budget
+# RouterGFM benchmark (Table 1): 9 targets x {5, 100}-shot; heaviest first. LP rows share one
+# edge split (App. B.3) but keep one router per budget block.
+ogbn-arxiv	node	5
+ogbn-arxiv	node	100
+photo	node	5
+photo	node	100
+airports	node	5
+airports	node	100
+chameleon	node	5
+chameleon	node	100
+dblp	edge	5
+dblp	edge	100
+cornell	edge	5
+cornell	edge	100
+qm7b	graph	5
+qm7b	graph	100
+toxcast	graph	5
+toxcast	graph	100
+mnist	graph	5
+mnist	graph	100

@@ -33,7 +33,7 @@ def _heads_cfg(cfg):
     return cfg.moe.routergfm.heads if hasattr(cfg, "moe") else cfg
 
 
-def _build_module(in_dim: int, out_dim: int, hcfg) -> nn.Module:
+def build_head_module(in_dim: int, out_dim: int, hcfg) -> nn.Module:
     kind = str(hcfg.type).lower()
     if kind == "linear":
         return nn.Linear(in_dim, out_dim)
@@ -43,7 +43,7 @@ def _build_module(in_dim: int, out_dim: int, hcfg) -> nn.Module:
     raise ValueError(f"Unknown head type {hcfg.type!r} (expected linear|mlp).")
 
 
-def _training_target(y: torch.Tensor, family: str, normalizer: Optional[RegressionNormalizer]) -> torch.Tensor:
+def training_target(y: torch.Tensor, family: str, normalizer: Optional[RegressionNormalizer]) -> torch.Tensor:
     if is_simplex_family(family):
         return torch.as_tensor(y).reshape(-1).long()
     y = torch.as_tensor(y).float()
@@ -55,7 +55,7 @@ def _training_target(y: torch.Tensor, family: str, normalizer: Optional[Regressi
     return y
 
 
-def _head_loss(out: torch.Tensor, target: torch.Tensor, family: str) -> torch.Tensor:
+def head_loss(out: torch.Tensor, target: torch.Tensor, family: str) -> torch.Tensor:
     if is_simplex_family(family):
         return F.cross_entropy(out, target)
     valid = torch.isfinite(target)
@@ -69,7 +69,7 @@ def _head_loss(out: torch.Tensor, target: torch.Tensor, family: str) -> torch.Te
     return (elem * valid).sum() / valid.sum()
 
 
-def _activate(out: torch.Tensor, family: str) -> torch.Tensor:
+def activate(out: torch.Tensor, family: str) -> torch.Tensor:
     if is_simplex_family(family):
         return torch.softmax(out, dim=-1)
     if family == MULTILABEL:
@@ -98,12 +98,16 @@ def fit_head(
     """
     hcfg = _heads_cfg(cfg)
     x = torch.as_tensor(emb_s).detach().float().cpu()
-    target = _training_target(torch.as_tensor(y_s).cpu(), family, normalizer)
+    target = training_target(torch.as_tensor(y_s).cpu(), family, normalizer)
     if x.size(0) != target.size(0):
         raise ValueError(f"Support embeddings ({x.size(0)}) and labels ({target.size(0)}) are misaligned.")
     if bool(hcfg.standardize_inputs) and x.size(0) > 0:
         mean = x.mean(dim=0)
-        std = x.std(dim=0, unbiased=False).clamp_min(1e-6)
+        std = x.std(dim=0, unbiased=False)
+        # Few-shot supports leave some dims near-constant; dividing by their tiny std blows query
+        # inputs (and unbounded regression outputs) up, so floor it relative to the typical scale.
+        floor = max(0.1 * float(std.pow(2).mean().sqrt()), 1e-3 * float(x.abs().mean()), 1e-6)
+        std = std.clamp_min(floor)
     else:
         mean = torch.zeros(x.size(1))
         std = torch.ones(x.size(1))
@@ -111,7 +115,7 @@ def fit_head(
 
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(int(seed))
-        module = _build_module(x.size(1), int(out_dim), hcfg)
+        module = build_head_module(x.size(1), int(out_dim), hcfg)
     device = torch.device(device) if device is not None else torch.device("cpu")
     module.to(device)
     x, target = x.to(device), target.to(device)
@@ -120,7 +124,7 @@ def fit_head(
     if x.size(0) > 0:
         for _ in range(int(hcfg.epochs)):
             optimizer.zero_grad()
-            loss = _head_loss(module(x), target, family)
+            loss = head_loss(module(x), target, family)
             loss.backward()
             optimizer.step()
     module.cpu()
@@ -136,7 +140,7 @@ def predict_head(head: FittedHead, emb: torch.Tensor) -> torch.Tensor:
     outs = []
     for start in range(0, x.size(0), _PREDICT_CHUNK):
         chunk = (x[start:start + _PREDICT_CHUNK] - head.mean) / head.std
-        outs.append(_activate(head.module(chunk), head.family))
+        outs.append(activate(head.module(chunk), head.family))
     if not outs:
         return torch.zeros(0, head.out_dim)
     return torch.cat(outs, dim=0)
@@ -181,8 +185,10 @@ def fit_predict_oof(
     """Out-of-fold support predictions: every item is predicted by a head not trained on it.
 
     ``folds`` defaults to ``heads.oof_folds`` and is capped at the support size.
-    Regression folds reuse the application's support normalizer so OOF and
-    query predictions share one normalized scale.
+    Regression fold heads normalize with their own training labels (so a held-out
+    label never shapes its fold head), and their predictions are returned in the
+    units of the application's support ``normalizer``, the scale of the query
+    predictions.
     """
     hcfg = _heads_cfg(cfg)
     emb_s = torch.as_tensor(emb_s).float().cpu()
@@ -195,11 +201,24 @@ def fit_predict_oof(
     oof = torch.full((n, int(out_dim)), float("nan"))
     for fold in range(k):
         held = fold_id == fold
+        fold_norm = RegressionNormalizer(normalizer.scale_floor).fit(y_s[~held]) if normalizer is not None else None
         head = fit_head(
-            emb_s[~held], y_s[~held], family, out_dim, cfg, seed=int(seed) + fold + 1, normalizer=normalizer, device=device
+            emb_s[~held], y_s[~held], family, out_dim, cfg,
+            seed=int(seed) + fold + 1, normalizer=fold_norm, device=device,
         )
-        oof[held] = predict_head(head, emb_s[held])
+        pred = predict_head(head, emb_s[held])
+        oof[held] = normalizer.transform(fold_norm.inverse(pred)) if fold_norm is not None else pred
     return oof
 
 
-__all__ = ["FittedHead", "fit_head", "fit_predict_oof", "oof_fold_ids", "predict_head"]
+__all__ = [
+    "FittedHead",
+    "activate",
+    "build_head_module",
+    "fit_head",
+    "fit_predict_oof",
+    "head_loss",
+    "oof_fold_ids",
+    "predict_head",
+    "training_target",
+]

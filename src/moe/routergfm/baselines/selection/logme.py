@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import math
 import time
+import warnings
 from typing import Any, Dict, Hashable, List, Mapping, Sequence, Tuple
 
 import numpy as np
@@ -27,6 +28,7 @@ from ...losses import is_simplex_family
 from .common import SelectionOutcome
 
 _INT_DTYPES = (torch.int64, torch.int32, torch.int16, torch.int8, torch.uint8, torch.bool)
+_EPS = 1e-5  # official LogME epsilon in the alpha / beta update denominators
 
 
 def _logme_single_target(
@@ -41,36 +43,38 @@ def _logme_single_target(
     """Evidence for one scalar target given the SVD of the feature matrix.
 
     ``s``: singular values of F [k]; ``u_t_y``: U^T y over those components;
-    ``y_norm_sq``: ||y||^2. Fixed-point iteration on (alpha, beta) from the
-    LogME reference implementation, returning the per-sample log evidence.
+    ``y_norm_sq``: ||y||^2. Fixed-point iteration on (alpha, beta) with the
+    official LogME updates ``alpha = gamma / (m^T m + 1e-5)`` and
+    ``beta = (n - gamma) / (||F m - y||^2 + 1e-5)``; the epsilons keep alpha and
+    beta finite when a few-shot target is (nearly) orthogonal to or interpolated
+    by the features; features reach this function at unit RMS, so the epsilons
+    act at a fixed relative scale. Everything is numpy float64 and written in t = alpha / beta,
+    so no power of alpha or beta is formed. Returns the per-sample log evidence.
     """
-    sigma = s**2
-    alpha, beta = 1.0, 1.0
+    sigma = np.asarray(s, dtype=np.float64) ** 2
+    x2 = np.asarray(u_t_y, dtype=np.float64) ** 2
+    res_out = max(float(y_norm_sq) - float(x2.sum()), 0.0)  # ||y||^2 outside the retained components
+
+    def moments(alpha, beta):
+        """(gamma, m^T m, ||F m - y||^2) at (alpha, beta)."""
+        t = alpha / beta
+        gamma = np.sum(sigma / (sigma + t))
+        m_sq = np.sum(sigma * x2 / (sigma + t) ** 2)
+        res_sq = np.sum(x2 * (t / (sigma + t)) ** 2) + res_out
+        return gamma, m_sq, res_sq
+
+    alpha, beta = np.float64(1.0), np.float64(1.0)
     for _ in range(max_iter):
-        gamma = float(np.sum(sigma * beta / (alpha + beta * sigma)))
-        m_sq = float(
-            np.sum((beta**2 * sigma * u_t_y**2) / (alpha + beta * sigma) ** 2)
-        )
-        res_sq = float(
-            np.sum((alpha**2 * u_t_y**2) / (alpha + beta * sigma) ** 2)
-        ) + max(y_norm_sq - float(np.sum(u_t_y**2)), 0.0)
-        alpha_new = gamma / m_sq if m_sq > 0 else alpha
-        beta_new = (n - gamma) / res_sq if res_sq > 0 else beta
-        if abs(alpha_new - alpha) / max(alpha, 1e-12) < tol and abs(
-            beta_new - beta
-        ) / max(beta, 1e-12) < tol:
-            alpha, beta = alpha_new, beta_new
-            break
+        gamma, m_sq, res_sq = moments(alpha, beta)
+        alpha_new, beta_new = gamma / (m_sq + _EPS), (n - gamma) / (res_sq + _EPS)
+        done = abs(alpha_new - alpha) / alpha < tol and abs(beta_new - beta) / beta < tol
         alpha, beta = alpha_new, beta_new
-    m_sq = float(np.sum((beta**2 * sigma * u_t_y**2) / (alpha + beta * sigma) ** 2))
-    res_sq = float(
-        np.sum((alpha**2 * u_t_y**2) / (alpha + beta * sigma) ** 2)
-    ) + max(y_norm_sq - float(np.sum(u_t_y**2)), 0.0)
+        if done:
+            break
+    _, m_sq, res_sq = moments(alpha, beta)
     # Dimensions beyond the k retained SVD components have sigma = 0, so their
     # log-determinant contribution is log(alpha) each.
-    log_det = float(np.sum(np.log(alpha + beta * sigma))) + (d - len(sigma)) * np.log(
-        alpha
-    )
+    log_det = np.sum(np.log(alpha + beta * sigma)) + (d - sigma.size) * np.log(alpha)
     evidence = (
         d / 2.0 * np.log(alpha)
         + n / 2.0 * np.log(beta)
@@ -128,6 +132,8 @@ def logme_score(
     n, d = f.shape
     if n < 2:
         return float("-inf")
+    # LogME is invariant to a global rescale; unit RMS pins the 1e-5 update epsilons to a fixed relative scale.
+    f = f / max(float(np.sqrt(np.mean(f * f))), 1e-12)
     if standardize:
         mu = f.mean(axis=0, keepdims=True)
         sd = f.std(axis=0, keepdims=True)
@@ -135,8 +141,10 @@ def logme_score(
 
     y_mat, is_float = _target_matrix(targets)
     if is_float and standardize:
-        y_mu = np.nanmean(y_mat, axis=0, keepdims=True)
-        y_sd = np.nanstd(y_mat, axis=0, keepdims=True)
+        with warnings.catch_warnings():  # all-missing columns stay NaN and are skipped below
+            warnings.simplefilter("ignore", RuntimeWarning)
+            y_mu = np.nanmean(y_mat, axis=0, keepdims=True)
+            y_sd = np.nanstd(y_mat, axis=0, keepdims=True)
         y_mat = (y_mat - y_mu) / np.maximum(y_sd, 1e-8)
 
     u, s, _ = np.linalg.svd(f, full_matrices=False)

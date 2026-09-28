@@ -333,6 +333,14 @@ def run_data_preparation_runtime(cfg) -> int:
         )
         return 1
 
+    # Shift split roots are an exclusive stage on top of prepared datasets:
+    # run the standard preparation first, then again with shift.build / shift.verify.
+    shift_cfg = dp_cfg.shift
+    if bool(shift_cfg.build) or bool(shift_cfg.verify):
+        from src.data_loader.shift_splits import run_shift_preparation
+
+        return run_shift_preparation(cfg)
+
     stages = _resolve_stage_plan(cfg, targets)
     if not stages:
         print("[DataPrep] No datasets to prepare. Check dataset list configuration.")

@@ -42,6 +42,12 @@ def embed_instances(encoder, model_cfg, data, positions: torch.Tensor, device, b
     out = torch.cat(chunks, dim=0)
     if out.size(0) != positions.numel():
         raise RuntimeError(f"{data.app.key}: embedded {out.size(0)} of {positions.numel()} instances.")
+    bad = ~torch.isfinite(out).all(dim=1)
+    if bool(bad.any()):
+        raise FloatingPointError(
+            f"{data.app.key}: the frozen {type(encoder).__name__} encoder produced non-finite readouts for "
+            f"{int(bad.sum())} of {out.size(0)} instances (e.g. positions {positions[bad][:5].tolist()})."
+        )
     return out
 
 

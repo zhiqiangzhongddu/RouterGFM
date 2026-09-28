@@ -181,8 +181,9 @@ def apply_shift(
     for the repo encoders, and added edges would have none).
     """
     level = str(task_level_raw).lower()
-    node_keys = [key for key in batch.keys() if key not in _INSTANCE_KEYS and batch.is_node_attr(key)]
-    edge_keys = [key for key in batch.keys() if key not in _INSTANCE_KEYS and batch.is_edge_attr(key)]
+    tensor_keys = [key for key in batch.keys() if key not in _INSTANCE_KEYS and torch.is_tensor(batch[key])]
+    node_keys = [key for key in tensor_keys if batch.is_node_attr(key)]
+    edge_keys = [key for key in tensor_keys if batch.is_edge_attr(key)]
     data_list = batch.to_data_list()
     for data in data_list:
         for key in edge_keys:

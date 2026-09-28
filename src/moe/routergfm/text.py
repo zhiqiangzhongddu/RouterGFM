@@ -17,7 +17,7 @@ from typing import Dict, Mapping, Optional, Sequence
 
 import torch
 
-from src.data_loader.dataset_domains import KEYWORD_DOMAINS, NAME_TO_DOMAIN
+from src.data_loader.dataset_domains import CLASS_TO_DOMAIN, KEYWORD_DOMAINS, NAME_TO_DOMAIN
 from src.utils.checkpoint import save_torch_atomic
 
 from .common import GRAPH_CLS, LINK, MULTILABEL, NODE_CLS, REGRESSION, AppSpec, ExpertSpec
@@ -65,6 +65,16 @@ _EXTRA_DOMAINS = {
     "mnist": "vision superpixel",
     "cifar10": "vision superpixel",
 }
+# The one domain vocabulary: every value of dataset_domain and of the dataset-class
+# map (real-data metadata), plus "unknown"; the metadata one-hot uses it.
+DOMAINS = tuple(
+    sorted(
+        set(CLASS_TO_DOMAIN.values())
+        | set(NAME_TO_DOMAIN.values())
+        | {d for d, _ in KEYWORD_DOMAINS}
+        | set(_EXTRA_DOMAINS.values())
+    )
+) + ("unknown",)
 
 _LEVEL_UNIT = {"node": "node", "edge": "node pair", "graph": "graph"}
 _INSTANCE_TEXT = {
@@ -299,6 +309,7 @@ class TextEncoder:
 
 __all__ = [
     "ADAPTATION_RULE",
+    "DOMAINS",
     "TextEncoder",
     "dataset_domain",
     "describe_application",

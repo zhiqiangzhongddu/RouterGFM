@@ -8,6 +8,7 @@ from the context, samples negatives as unique unordered non-edges, and
 removes the target edge from each induced subgraph (SEAL-style).
 """
 
+import random
 import tempfile
 import unittest
 from pathlib import Path
@@ -96,6 +97,17 @@ class EdgeSplitV2Test(unittest.TestCase):
             self.assertFalse(neg_keys & edge_keys, f"{key} contains real (possibly reversed) edges")
             self.assertFalse(neg_keys & all_neg, f"{key} shares negatives with another split")
             all_neg |= neg_keys
+
+    def test_negatives_do_not_depend_on_global_python_random_state(self):
+        data = _random_undirected_graph()
+        payloads = []
+        for state in (0, 1):
+            random.seed(state)
+            before = random.getstate()
+            payloads.append(self._payload(data))
+            self.assertEqual(random.getstate(), before)  # the caller's stream is left untouched
+        for key in ("train_neg_edge_index", "val_neg_edge_index", "test_neg_edge_index"):
+            self.assertTrue(torch.equal(payloads[0][key], payloads[1][key]), key)
 
     def test_directed_only_edges_survive(self):
         # WebKB-style storage: some edges exist in one direction only.

@@ -12,16 +12,25 @@ from __future__ import annotations
 import os
 import time
 from collections import Counter
+from pathlib import Path
 
 import torch
 from torch import optim
 from torch_geometric.loader import DataLoader
 
 from src.data_loader import create_dataset, dataset_info, log_split_instance_counts
+from src.data_loader.shift_splits import verify_shift_root
 from src.moe.identity import behavior_fingerprint
 from src.moe.routergfm.common import infer_task_family
 from src.moe.routergfm.losses import is_simplex_family
-from src.moe.shift_eval import brier_risk, collect_query_outputs, save_query_predictions
+from src.moe.shift_eval import (
+    brier_risk,
+    collect_query_outputs,
+    normalized_targets,
+    raw_outputs,
+    save_query_predictions,
+    support_normalizer,
+)
 from src.utils.checkpoint import save_checkpoint, save_training_log
 from src.utils.dataset_helpers import (
     is_few_shot_split,
@@ -88,6 +97,10 @@ class OGMMRunner:
         self._is_setup = True
         cfg, ogmm_cfg = self.cfg, self.ogmm_cfg
         ds_cfg = ogmm_cfg.dataset
+        split_root = shared_split_root(cfg)
+        if Path(split_root).resolve().parent == Path(str(cfg.data_preparation.shift.root)).resolve():
+            # A missing/regenerated shift file would otherwise be silently replaced by a standard split.
+            verify_shift_root(split_root, [(str(ds_cfg.name), self.task_level_raw, int(cfg.seed), self.split)])
 
         self.dataset = create_dataset(
             name=ds_cfg.name,
@@ -142,6 +155,14 @@ class OGMMRunner:
         self.support = [support[i] for i in range(len(support))]
         if not self.support:
             raise ValueError("[OGMM] Empty support set.")
+        self.support_targets = torch.cat([torch.as_tensor(item.y).reshape(1, -1).float() for item in self.support])
+        self.normalizer = support_normalizer(self.support, self.task_family)
+        if self.normalizer is not None:
+            # Experts, generated labels (U[min, max] of the domain targets), and merging work in
+            # support median/MAD-normalized units, as RouterGFM's heads; evaluation reports raw units.
+            self.support = [item.clone() for item in self.support]
+            for item in self.support:
+                item.y = normalized_targets(self.normalizer, torch.as_tensor(item.y).float())
 
     # ------------------------------------------------------------------ #
     # Run-name / paths
@@ -281,7 +302,7 @@ class OGMMRunner:
         for expert, info in zip(experts, self.expert_info):
             items = [self.support[i] for i in domains[info["domain"]]]
             sizes = torch.tensor([float(item.num_nodes) for item in items])
-            num_nodes = int(min(max(round(float(sizes.median())), _GEN_MIN_NODES), _GEN_MAX_NODES))
+            num_nodes = int(min(max(round(float(sizes.quantile(0.5))), _GEN_MIN_NODES), _GEN_MAX_NODES))
             targets = torch.cat([torch.as_tensor(item.y).reshape(1, -1).float() for item in items])
             graphs = generate_for_expert(
                 expert,
@@ -353,6 +374,7 @@ class OGMMRunner:
 
         def model_fn(batch):
             logits, gate = model(to_dense_instances(batch, self.task_level_raw))
+            logits = raw_outputs(self.normalizer, logits)
             logits_buffer.append(logits.detach().cpu())
             gate_sum.add_(gate.detach().sum(dim=0).cpu())
             return logits
@@ -361,9 +383,9 @@ class OGMMRunner:
         num_queries = int(self.query_outputs["pred"].size(0))
         self.test_mean_gate = (gate_sum / max(num_queries, 1)).tolist()
         metrics = concat_and_compute_metrics(logits_buffer, [self.query_outputs["y"]], self.task_type, "test")
-        support_targets = torch.cat([torch.as_tensor(item.y).reshape(1, -1).float() for item in self.support])
         metrics["test_brier"] = brier_risk(
-            self.query_outputs, task_family=self.task_family, support_targets=support_targets,
+            self.query_outputs, task_family=self.task_family, support_targets=self.support_targets,
+            reg_kind=str(self.cfg.moe.routergfm.loss.regression),
         )
         return metrics
 

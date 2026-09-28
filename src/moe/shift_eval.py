@@ -3,11 +3,13 @@
 One readout rule, one way to collect per-query outputs, and a Brier risk that
 delegates to RouterGFM's per-instance routing loss (App. B.2), so every method
 in the shift comparison is scored by the same function as RouterGFM itself.
+Regression heads train on the same support median/MAD-normalized targets as
+RouterGFM's heads and report raw-unit outputs (:func:`support_normalizer`).
 """
 
 from __future__ import annotations
 
-from typing import Callable, Dict, Mapping, Optional
+from typing import Callable, Dict, Mapping, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -31,6 +33,23 @@ def instance_readout(node_repr: torch.Tensor, data, task_level_raw: str, pool_mo
         src, dst = edge_label_index
         return node_repr[src] * node_repr[dst]
     return pool_nodes(node_repr, get_batch_vector(data), mode=pool_mode)
+
+
+def support_normalizer(support: Sequence, task_family: str) -> Optional[RegressionNormalizer]:
+    """Support median/MAD normalizer of the raw targets of *support* (instance graphs) for regression, else None."""
+    if task_family != REGRESSION:
+        return None
+    return RegressionNormalizer().fit(torch.stack([torch.as_tensor(item.y).reshape(-1).float() for item in support]))
+
+
+def normalized_targets(normalizer: Optional[RegressionNormalizer], y: torch.Tensor) -> torch.Tensor:
+    """Raw targets -> the units regression heads train in (unchanged without a normalizer); keeps the device."""
+    return y if normalizer is None else normalizer.transform(y.detach().cpu()).to(y.device)
+
+
+def raw_outputs(normalizer: Optional[RegressionNormalizer], out: torch.Tensor) -> torch.Tensor:
+    """Regression head outputs -> raw target units (unchanged without a normalizer); keeps the device."""
+    return out if normalizer is None else normalizer.inverse(out.cpu()).to(out.device)
 
 
 def _probabilities(logits: torch.Tensor, task_type: str, label_dim: int) -> torch.Tensor:
@@ -115,4 +134,12 @@ def save_query_predictions(path: str, outputs: Mapping[str, torch.Tensor], meta:
     )
 
 
-__all__ = ["brier_risk", "collect_query_outputs", "instance_readout", "save_query_predictions"]
+__all__ = [
+    "brier_risk",
+    "collect_query_outputs",
+    "instance_readout",
+    "normalized_targets",
+    "raw_outputs",
+    "save_query_predictions",
+    "support_normalizer",
+]

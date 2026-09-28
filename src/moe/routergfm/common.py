@@ -99,13 +99,20 @@ def base_group(dataset: str) -> str:
 
 @dataclass(frozen=True)
 class AppSpec:
-    """One application ``a = (dataset, task_level, budget, seed)``."""
+    """One application ``a = (dataset, task_level, budget, seed)``.
+
+    ``split_root_tag`` (default ``''``) reads the split files from an
+    alternative split root (``analysis.shift_root/<tag>``, App. D.6); a
+    non-empty tag is appended to ``key`` and ``data_key`` so split metadata,
+    predictions, and descriptor coverage never collide with the standard split.
+    """
 
     dataset: str
     task_level: str
     budget: int
     seed: int
     lp_split: Tuple[float, float, float] = (0.1, 0.05, 0.1)
+    split_root_tag: str = ""
 
     @property
     def split(self) -> Tuple[float, float, float]:
@@ -118,14 +125,18 @@ class AppSpec:
         return base_group(self.dataset)
 
     @property
+    def _tag_suffix(self) -> str:
+        return f"__{self.split_root_tag}" if self.split_root_tag else ""
+
+    @property
     def key(self) -> str:
-        return f"{self.dataset}__{self.task_level}__b{int(self.budget)}__s{int(self.seed)}"
+        return f"{self.dataset}__{self.task_level}__b{int(self.budget)}__s{int(self.seed)}{self._tag_suffix}"
 
     @property
     def data_key(self) -> str:
         return (
             f"{self.dataset}__{self.task_level}__"
-            f"{format_split_for_name(self.split)}__s{int(self.seed)}"
+            f"{format_split_for_name(self.split)}__s{int(self.seed)}{self._tag_suffix}"
         )
 
     @property
@@ -135,6 +146,8 @@ class AppSpec:
     def to_dict(self) -> Dict[str, Any]:
         payload = asdict(self)
         payload["lp_split"] = list(self.lp_split)
+        if not self.split_root_tag:
+            del payload["split_root_tag"]  # standard applications serialize as before
         return payload
 
     @classmethod
@@ -145,6 +158,7 @@ class AppSpec:
             budget=int(payload["budget"]),
             seed=int(payload["seed"]),
             lp_split=tuple(float(v) for v in payload.get("lp_split", (0.1, 0.05, 0.1))),
+            split_root_tag=str(payload.get("split_root_tag", "")),
         )
 
 

@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import torch
 
+from src.moe.routergfm.applications import instance_set_key
 from src.moe.routergfm.common import AppSpec, RouterPaths, TASK_FAMILIES
 from src.utils.checkpoint import save_torch_atomic
 
@@ -62,6 +63,15 @@ def family_slices(num_spectral: int = DEFAULT_NUM_SPECTRAL) -> Dict[str, slice]:
 # Layout for the default ``num_spectral``; use the functions for other values.
 DESCRIPTOR_NAMES = descriptor_names()
 FAMILY_SLICES = family_slices()
+
+
+def _eigvalsh(matrices: torch.Tensor) -> torch.Tensor:
+    """Batched eigenvalues of small symmetric matrices, computed with CPU LAPACK.
+
+    cuSOLVER is ~20x slower on these batches and fails intermittently
+    (CUSOLVER_STATUS_INTERNAL_ERROR) on large ones.
+    """
+    return torch.linalg.eigvalsh(matrices.cpu()).to(matrices.device)
 
 
 def _top_desc(values: torch.Tensor, k: int) -> torch.Tensor:
@@ -128,7 +138,7 @@ def _dense_batch(graphs: Sequence[Any], level: str, task_family: str, k: int, de
     clustering = torch.where(wedges > 0, triangles / wedges.clamp(min=1), torch.zeros_like(deg))
     dinv = torch.where(deg > 0, deg.clamp(min=1).rsqrt(), torch.zeros_like(deg))
     lap = torch.diag_embed((deg > 0).to(dt)) - dinv[:, :, None] * A * dinv[:, None, :]
-    lap_eig = torch.linalg.eigvalsh(lap).clamp(min=0)
+    lap_eig = _eigvalsh(lap).clamp(min=0)
     # Zero eigenvalues of the normalized Laplacian = components (isolated nodes included).
     components = (lap_eig < _ZERO_EIG_TOL).sum(-1) - (n_max - n)
     structure = torch.cat([
@@ -145,7 +155,7 @@ def _dense_batch(graphs: Sequence[Any], level: str, task_family: str, k: int, de
     norm_std = _masked_std(norms, norm_mean, maskf, count)
     Xc = (X - (X.sum(1) / count[:, None])[:, None, :]) * maskf[..., None]
     gram = Xc @ Xc.transpose(1, 2) if n_max <= X.size(2) else Xc.transpose(1, 2) @ Xc
-    sv = torch.linalg.eigvalsh(gram).clamp(min=0).sqrt()
+    sv = _eigvalsh(gram).clamp(min=0).sqrt()
     sv_total = sv.sum(-1, keepdim=True)
     sv_top = torch.where(sv_total > 0, _top_desc(sv, k) / sv_total.clamp(min=1e-12), torch.zeros(B, k, dtype=dt, device=device))
     Xn = X / norms.clamp(min=1e-12)[..., None]
@@ -250,21 +260,29 @@ def compute_descriptors(data: Any, positions, cfg, *, device=None) -> torch.Tens
 
 
 def ensure_descriptors(cfg, data: Any, provider: Optional[Any] = None) -> Dict[str, Any]:
-    """Load or build the per-data-key descriptor cache ``{'positions', 'z', 'names'}``.
+    """Load or build the descriptor cache ``{'positions', 'z', 'names', 'data_keys'}``.
 
-    *data* is an ``AppData`` or an ``AppSpec``. For an ``AppSpec`` an existing
-    cache is trusted and the application is loaded (via *provider*, default
-    ``RealDataProvider``) only on a miss. For an ``AppData`` the cache is
-    extended with any missing support / diagnostic / query position.
-    ``positions`` are sorted ascending and ``z`` is raw (unstandardized).
+    Descriptors are label- and split-free, so the cache is shared by every
+    application on one instance set: it lives at
+    ``RouterPaths.descriptor_file(instance_set_key(app))`` (all budgets/seeds of
+    a node or graph dataset share it; LP instance sets are per data key).
+    ``data_keys`` lists the applications whose support / diagnostic / query
+    positions it covers.
+
+    *data* is an ``AppData`` or an ``AppSpec``. For an ``AppSpec`` a cache that
+    covers its data key is trusted and the application is loaded (via
+    *provider*, default ``RealDataProvider``) only otherwise. For an ``AppData``
+    the cache is extended with any missing position. ``positions`` are sorted
+    ascending and ``z`` is raw (unstandardized).
     """
     app = data if isinstance(data, AppSpec) else data.app
     names = descriptor_names(int(cfg.moe.routergfm.descriptors.num_spectral))
-    path = RouterPaths.from_cfg(cfg).descriptor_file(app.data_key)
+    path = RouterPaths.from_cfg(cfg).descriptor_file(instance_set_key(app))
     cache = torch.load(path, map_location="cpu") if path.exists() else None
     if cache is not None and list(cache.get("names", [])) != names:
         cache = None  # stale layout (num_spectral changed)
-    if cache is not None and isinstance(data, AppSpec):
+    covered = set(cache.get("data_keys", ())) if cache is not None else set()
+    if isinstance(data, AppSpec) and app.data_key in covered:
         return cache
     if isinstance(data, AppSpec):
         if provider is None:
@@ -280,12 +298,12 @@ def ensure_descriptors(cfg, data: Any, provider: Optional[Any] = None) -> Dict[s
     ]))
     have = cache["positions"] if cache is not None else torch.empty(0, dtype=torch.long)
     missing = needed[~torch.isin(needed, have)]
-    if cache is not None and missing.numel() == 0:
+    if cache is not None and missing.numel() == 0 and app.data_key in covered:
         return cache
     positions = torch.cat([have, missing])
     z = torch.cat([cache["z"] if cache is not None else torch.zeros(0, len(names)), compute_descriptors(data, missing, cfg)])
     order = torch.argsort(positions)
-    cache = {"positions": positions[order], "z": z[order], "names": names}
+    cache = {"positions": positions[order], "z": z[order], "names": names, "data_keys": sorted(covered | {app.data_key})}
     save_torch_atomic(str(path), cache)
     return cache
 

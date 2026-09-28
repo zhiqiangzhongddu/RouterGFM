@@ -4,7 +4,8 @@
 class)``; modules are imported on first use, so a missing or broken baseline
 does not affect the others. A runner is ``Runner(cfg, app, infra)`` with
 ``fit()``, ``predict_queries()``, ``evaluate()``, ``best_metrics`` and
-``best_epoch``; :mod:`.run` drives it. Selection baselines live in
+``best_epoch``; :mod:`.run` drives it. Mixtures over a candidate subset of E_a
+(SAGMM-PE, META-DES) share :mod:`.candidates`. Selection baselines live in
 :mod:`.selection`.
 """
 

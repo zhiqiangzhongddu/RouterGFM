@@ -51,7 +51,6 @@ def set_routergfm_cfg(cfg: CN) -> None:
     rg.task = "benchmark"
     rg.output_root = "outputs/routergfm"  # all RouterGFM artifacts live below this root
     rg.device_batch_size = 256  # batch size for frozen-encoder embedding passes
-    rg.num_workers = 0
 
     # ------------------------------------------------------------------ #
     # Expert pool (App. B.1): 7 architectures x 7 objectives x 12 sources
@@ -146,7 +145,9 @@ def set_routergfm_cfg(cfg: CN) -> None:
     rg.router.topk = 5  # K
     rg.router.retrieval_j = 32  # J nearest archive records
     rg.router.per_app_cap = 8  # max retrieved records from one source application
-    rg.router.bandwidth = 1.0  # h in Eq. 6
+    rg.router.bandwidth = 0.3  # h in Eq. 6 for L_loc during training (and at deployment unless select_bandwidth)
+    rg.router.bandwidth_grid = [0.05, 0.1, 0.2, 0.3, 0.5, 1.0]
+    rg.router.select_bandwidth = True  # select h jointly with rho / tau on validation applications from bandwidth_grid
     rg.router.rho = -1.0  # Eq. 7 in [0,1]; < 0 selects rho on validation applications from rho_grid
     rg.router.rho_grid = [0.0, 0.25, 0.5, 0.75, 1.0]
     rg.router.rho_train = 1.0  # rho used inside L_loc during training
@@ -203,14 +204,19 @@ def set_routergfm_cfg(cfg: CN) -> None:
     rg.baselines = CN()
     rg.baselines.method = ""  # selection: metadata_mlp | nearest_application | metagl | metagl_metadata | logme | model_spider
     #                          # matched:   metagl_u | sagmm_pe | meta_des | kdem | ppem
-    rg.baselines.datasets = list(ROUTERGFM_TARGET_DATASETS)  # "dataset:task_level" evaluated by a baseline run
+    # "dataset:task_level" evaluated by a baseline run; Table 9 selection runs use the five node / single-label
+    # graph classification targets (photo, ogbn-arxiv, airports, chameleon, mnist)
+    rg.baselines.datasets = list(ROUTERGFM_TARGET_DATASETS)
     rg.baselines.budgets = [5, 100]
     rg.baselines.num_runs = 5  # seeds taken from apps.seeds
     rg.baselines.topk = 5  # team / shortlist size K
-    rg.baselines.candidate_pool = 16  # M candidate experts for SAGMM-PE / META-DES
-    rg.baselines.candidate_rule = "historical_mean"  # historical_mean | eligible | random
+    rg.baselines.candidate_pool = 16  # M candidate experts for SAGMM-PE / META-DES (<= 0: all of E_a)
+    # historical_mean (mean normalised rank over same-family historical apps; never-observed experts last,
+    # ties in catalog order) | eligible (all of E_a) | random; see src/moe/routergfm/baselines/candidates.py
+    rg.baselines.candidate_rule = "historical_mean"
     rg.baselines.run_tasks_tsv = False
-    rg.baselines.tasks_tsv = "slurm/moe.routergfm_baselines.tsv"  # header: method dataset task_level budget
+    # header: method dataset task_level budget (selection baselines: slurm/moe.routergfm_selection.tsv)
+    rg.baselines.tasks_tsv = "slurm/moe.routergfm_baselines.tsv"
     rg.baselines.output_dir = "outputs/routergfm/baselines"
     rg.baselines.skip_if_exists = True
 

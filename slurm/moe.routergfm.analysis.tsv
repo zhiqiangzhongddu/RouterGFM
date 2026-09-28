@@ -1,0 +1,56 @@
+# kind	dataset	task_level	budget
+# RouterGFM analyses (paper App. D): insertion (Table 10), calibration (Table 11), team_size (Table 12),
+# archive_reliability (Table 13), specialization (Table 14; 'all' pools every apps.targets entry of one budget
+# into terciles), and shift (Table 15; node/graph targets only, conditions without a split file are skipped).
+# Mechanism analyses at 5 shots, shift at both budgets; heaviest kinds first.
+insertion	ogbn-arxiv	node	5
+insertion	photo	node	5
+insertion	airports	node	5
+insertion	chameleon	node	5
+insertion	dblp	edge	5
+insertion	cornell	edge	5
+insertion	qm7b	graph	5
+insertion	toxcast	graph	5
+insertion	mnist	graph	5
+calibration	ogbn-arxiv	node	5
+calibration	photo	node	5
+calibration	airports	node	5
+calibration	chameleon	node	5
+calibration	dblp	edge	5
+calibration	cornell	edge	5
+calibration	qm7b	graph	5
+calibration	toxcast	graph	5
+calibration	mnist	graph	5
+team_size	ogbn-arxiv	node	5
+team_size	photo	node	5
+team_size	airports	node	5
+team_size	chameleon	node	5
+team_size	dblp	edge	5
+team_size	cornell	edge	5
+team_size	qm7b	graph	5
+team_size	toxcast	graph	5
+team_size	mnist	graph	5
+archive_reliability	ogbn-arxiv	node	5
+archive_reliability	photo	node	5
+archive_reliability	airports	node	5
+archive_reliability	chameleon	node	5
+archive_reliability	dblp	edge	5
+archive_reliability	cornell	edge	5
+archive_reliability	qm7b	graph	5
+archive_reliability	toxcast	graph	5
+archive_reliability	mnist	graph	5
+specialization	all	-	5
+shift	ogbn-arxiv	node	5
+shift	ogbn-arxiv	node	100
+shift	photo	node	5
+shift	photo	node	100
+shift	airports	node	5
+shift	airports	node	100
+shift	chameleon	node	5
+shift	chameleon	node	100
+shift	qm7b	graph	5
+shift	qm7b	graph	100
+shift	toxcast	graph	5
+shift	toxcast	graph	100
+shift	mnist	graph	5
+shift	mnist	graph	100

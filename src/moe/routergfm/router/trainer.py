@@ -11,7 +11,8 @@ local estimates (Eq. 7) on sampled (x, e) pairs of D_b x Omega_b (Eq. 10).
 Retrieval searches record keys refreshed at the start of every update without
 gradients; the kernel weights of the retrieved records are differentiable.
 The checkpoint is selected on validation applications of held-out groups, and
-rho / tau on the mixture routing risk of their stored diagnostic predictions.
+rho / tau / the kernel bandwidth h on the mixture routing risk of their stored
+diagnostic predictions.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ import torch
 
 from src.utils.checkpoint import cfg_to_dict, save_json_atomic, save_torch_atomic
 
-from ..applications import derive_seed
+from ..applications import derive_seed, instance_set_key
 from ..archive import Archive, build_archive
 from ..common import (
     AppSpec,
@@ -64,6 +65,39 @@ def router_run_key(target_group: str, budget: int, seed: int) -> str:
     return f"{target_group}__b{int(budget)}__s{int(seed)}"
 
 
+# Bookkeeping and deploy-time keys; the router seed is part of the run key.
+_UNHASHED = {"router": ("skip_if_exists", "per_seed", "seed"), "archive": ("perturbation", "perturbation_seed")}
+
+
+def router_cfg_hash(cfg) -> str:
+    """Hash of the config a router bundle is trained under (``meta['cfg_hash']``)."""
+    rg = cfg.moe.routergfm
+    blocks = {k: cfg_to_dict(rg[k]) for k in ("router", "descriptors", "archive", "graph", "heads", "loss")}
+    for block, keys in _UNHASHED.items():
+        for key in keys:
+            blocks[block].pop(key, None)
+    return stable_hash(blocks)
+
+
+def reusable_bundle(cfg, directory: Path) -> bool:
+    """True when ``router.skip_if_exists`` and *directory* holds a bundle trained under the current config.
+
+    A bundle trained under another config raises instead of being reused
+    silently (or retrained implicitly): result rows are stamped with the
+    current config.
+    """
+    path = Path(directory) / BUNDLE_FILE
+    if not (bool(cfg.moe.routergfm.router.skip_if_exists) and path.is_file()):
+        return False
+    stored, current = torch.load(str(path), map_location="cpu")["meta"].get("cfg_hash"), router_cfg_hash(cfg)
+    if stored != current:
+        raise ValueError(
+            f"Router bundle at {directory} was trained under another config (cfg_hash {stored} != {current}); "
+            "use another output_root or set router.skip_if_exists False."
+        )
+    return True
+
+
 @dataclass
 class RouterBundle:
     """A trained router and what deployment needs to rebuild H and M around it."""
@@ -73,6 +107,7 @@ class RouterBundle:
     numeric_stats: Dict[str, Dict[str, torch.Tensor]]  # context-graph numeric standardization (build_context_graph)
     rho: float
     tau: float
+    bandwidth: float  # h of Eq. 6 at deployment (validation-selected unless router.select_bandwidth is False)
     catalog_ids: List[str]
     train_apps: List[AppSpec]
     val_apps: List[AppSpec]
@@ -99,7 +134,7 @@ class RouterTrainer:
     ``graph`` and ``archive`` cover the training and validation applications
     (never the deployment target's group); ``descriptors`` maps a data key to
     its raw descriptor cache; ``provider`` supplies the validation
-    applications' diagnostic labels for rho / tau selection.
+    applications' diagnostic labels for rho / tau / bandwidth selection.
     """
 
     def __init__(
@@ -164,6 +199,7 @@ class RouterTrainer:
         }
         self.rho = float(self.rt.rho) if float(self.rt.rho) >= 0 else None
         self.tau = float(self.rt.tau) if float(self.rt.tau) >= 0 else None
+        self.bandwidth = None if bool(self.rt.select_bandwidth) else float(self.rt.bandwidth)
         self.log: Dict[str, Any] = {}
 
     # -- episodes --------------------------------------------------------------
@@ -228,17 +264,25 @@ class RouterTrainer:
         chunks = range(0, len(self.archive), _KEY_CHUNK)
         return torch.cat([self.model.keys(rep[s:s + _KEY_CHUNK], v[nodes[s:s + _KEY_CHUNK]]) for s in chunks])
 
-    def _retrieve(
+    def _neighbours(
         self, z: torch.Tensor, nodes: torch.Tensor, v: torch.Tensor, record_keys: torch.Tensor, allowed: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Eq. 6 weights ``[P, J]`` and centered residuals of the records retrieved for (z_p, e_p)."""
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Query keys ``[P, d_k]``, keys ``[P, J, d_k]`` and validity ``[P, J]`` of the records retrieved for
+        (z_p, e_p), and their centered residuals; the top-J search does not depend on the bandwidth."""
         query = self.model.keys(z, v[nodes])
         idx, valid = search(
             query.detach(), record_keys, self.archive.app, allowed, int(self.rt.retrieval_j), int(self.rt.per_app_cap)
         )
         flat = idx.reshape(-1)
         selected = self.model.keys(self.archive.rep[flat], v[self._rec_node[flat]]).view(*idx.shape, -1)
-        return kernel_weights(query, selected, valid, float(self.rt.bandwidth)), self._residual[idx]
+        return query, selected, valid, self._residual[idx]
+
+    def _retrieve(
+        self, z: torch.Tensor, nodes: torch.Tensor, v: torch.Tensor, record_keys: torch.Tensor, allowed: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Eq. 6 weights ``[P, J]`` at the training bandwidth and centered residuals of the retrieved records."""
+        query, selected, valid, residual = self._neighbours(z, nodes, v, record_keys, allowed)
+        return kernel_weights(query, selected, valid, float(self.rt.bandwidth)), residual
 
     def _losses(
         self, ep: _Episode, rows: torch.Tensor, cols: torch.Tensor, record_keys: torch.Tensor
@@ -337,12 +381,18 @@ class RouterTrainer:
         })
         return self.log
 
-    # -- rho / tau -------------------------------------------------------------------
+    # -- rho / tau / bandwidth ---------------------------------------------------------
     @torch.no_grad()
     def _mixture_risks(
-        self, ep: _Episode, rhos: Sequence[float], taus: Sequence[float], record_keys: torch.Tensor
+        self,
+        ep: _Episode,
+        bandwidths: Sequence[float],
+        rhos: Sequence[float],
+        taus: Sequence[float],
+        record_keys: torch.Tensor,
     ) -> torch.Tensor:
-        """Mean mixture routing loss on D_v of the top-K team for every (rho, tau): ``[len(rhos), len(taus)]``."""
+        """Mean mixture routing loss on D_v of the top-K team for every (h, rho, tau):
+        ``[len(bandwidths), len(rhos), len(taus)]``. One search per (instance, team expert) serves every h."""
         key = ep.app.data_key
         data = self.provider.load(ep.app)
         if not torch.equal(torch.as_tensor(data.diag_pos).cpu(), self._diag_pos[key]):
@@ -354,47 +404,60 @@ class RouterTrainer:
         z = self._z[key]
         n = z.size(0)
         v = self.model.project(self.graph.x)[EXPERT]
-        w, residual = self._retrieve(z.repeat_interleave(k, 0), team.repeat(n), v, record_keys, self._allowed(ep))
-        w, residual = w.view(n, k, -1), residual.view(n, k, -1)
+        query, selected, valid, residual = self._neighbours(
+            z.repeat_interleave(k, 0), team.repeat(n), v, record_keys, self._allowed(ep)
+        )
+        residual = residual.view(n, k, -1)
         preds = self.store.pred_matrix(key, [self.graph.expert_ids[e] for e in team.tolist()]).to(self.device)
         normalizer = app_normalizer(self.cfg, data)
-        out = torch.zeros(len(rhos), len(taus))
-        for i, rho in enumerate(rhos):
-            r_hat = local_estimate(mu_team.expand(n, k), w, residual, float(rho))  # Eq. 7
-            for j, tau in enumerate(taus):
-                alpha = mixture_weights(r_hat, float(tau))  # Eq. 8
-                mixed = (alpha.unsqueeze(-1) * preds).sum(dim=1)  # Eq. 1
-                loss = instance_losses(self.cfg, mixed.cpu(), data.labels["diag"], data.task_family, normalizer)
-                out[i, j] = loss[torch.isfinite(loss)].mean()
+        out = torch.zeros(len(bandwidths), len(rhos), len(taus))
+        for b, h in enumerate(bandwidths):
+            w = kernel_weights(query, selected, valid, float(h)).view(n, k, -1)  # Eq. 6
+            for i, rho in enumerate(rhos):
+                r_hat = local_estimate(mu_team.expand(n, k), w, residual, float(rho))  # Eq. 7
+                for j, tau in enumerate(taus):
+                    alpha = mixture_weights(r_hat, float(tau))  # Eq. 8
+                    mixed = (alpha.unsqueeze(-1) * preds).sum(dim=1)  # Eq. 1
+                    loss = instance_losses(self.cfg, mixed.cpu(), data.labels["diag"], data.task_family, normalizer)
+                    out[b, i, j] = loss[torch.isfinite(loss)].mean()
         return out
 
     @torch.no_grad()
-    def select_rho_tau(self) -> Tuple[float, float]:
-        """Configured rho / tau if >= 0, else the grid point minimizing the mean validation mixture risk."""
+    def select_integration_params(self) -> Tuple[float, float, float]:
+        """(rho, tau, bandwidth): the configured rho / tau if >= 0 and ``router.bandwidth`` unless
+        ``router.select_bandwidth``; the rest jointly at the grid point minimizing the mean validation
+        mixture risk (``bandwidth_grid`` x ``rho_grid`` x ``tau_grid``)."""
         rt = self.rt
         rhos = [float(rt.rho)] if float(rt.rho) >= 0 else [float(r) for r in rt.rho_grid]
         taus = [float(rt.tau)] if float(rt.tau) >= 0 else [float(t) for t in rt.tau_grid]
-        if float(rt.rho) >= 0 and float(rt.tau) >= 0:
-            self.rho, self.tau = rhos[0], taus[0]
-            return self.rho, self.tau
+        select_h = bool(rt.select_bandwidth)
+        bandwidths = [float(h) for h in rt.bandwidth_grid] if select_h else [float(rt.bandwidth)]
+        if float(rt.rho) >= 0 and float(rt.tau) >= 0 and not select_h:
+            self.rho, self.tau, self.bandwidth = rhos[0], taus[0], bandwidths[0]
+            return self.rho, self.tau, self.bandwidth
         if self.provider is None:
-            raise ValueError("Selecting rho/tau needs a provider for the validation applications' diagnostic labels.")
+            raise ValueError(
+                "Selecting rho/tau/bandwidth needs a provider for the validation applications' diagnostic labels."
+            )
         self.model.eval()
         record_keys = self._record_keys()
-        risk = torch.stack([self._mixture_risks(ep, rhos, taus, record_keys) for ep in self._val]).mean(dim=0)
-        i, j = divmod(int(torch.argmin(risk)), len(taus))
-        self.rho, self.tau = rhos[i], taus[j]
-        self.log["rho_tau_grid"] = [
-            {"rho": r, "tau": t, "risk": float(risk[a, b])} for a, r in enumerate(rhos) for b, t in enumerate(taus)
+        risks = [self._mixture_risks(ep, bandwidths, rhos, taus, record_keys) for ep in self._val]
+        risk = torch.stack(risks).mean(dim=0)
+        b, rest = divmod(int(torch.argmin(risk)), len(rhos) * len(taus))
+        i, j = divmod(rest, len(taus))
+        self.rho, self.tau, self.bandwidth = rhos[i], taus[j], bandwidths[b]
+        self.log["integration_grid"] = [
+            {"bandwidth": h, "rho": r, "tau": t, "risk": float(risk[c, a, d])}
+            for c, h in enumerate(bandwidths) for a, r in enumerate(rhos) for d, t in enumerate(taus)
         ]
-        self.log.update({"rho": self.rho, "tau": self.tau})
-        return self.rho, self.tau
+        self.log.update({"rho": self.rho, "tau": self.tau, "bandwidth": self.bandwidth})
+        return self.rho, self.tau, self.bandwidth
 
     # -- bundle --------------------------------------------------------------------------
     def save(self, directory) -> Path:
-        """Write ``bundle.pt`` (model, standardizer, graph numeric stats, rho, tau, apps, log) and ``log.json``."""
-        if self.rho is None or self.tau is None:
-            raise RuntimeError("rho/tau are not set: call select_rho_tau() before save().")
+        """Write ``bundle.pt`` (model, standardizer, graph numeric stats, rho, tau, h, apps, log) and ``log.json``."""
+        if self.rho is None or self.tau is None or self.bandwidth is None:
+            raise RuntimeError("rho/tau/bandwidth are not set: call select_integration_params() before save().")
         directory = Path(directory)
         cpu = lambda value: value.detach().cpu() if torch.is_tensor(value) else value  # noqa: E731
         payload = {
@@ -408,6 +471,7 @@ class RouterTrainer:
             "numeric_stats": {t: {k: cpu(v) for k, v in s.items()} for t, s in self.graph.numeric_stats.items()},
             "rho": float(self.rho),
             "tau": float(self.tau),
+            "bandwidth": float(self.bandwidth),
             "catalog_ids": [spec.expert_id for spec in self.catalog],
             "train_apps": [a.to_dict() for a in self.apps_train],
             "val_apps": [a.to_dict() for a in self.apps_val],
@@ -417,7 +481,10 @@ class RouterTrainer:
             "meta": self.meta,
         }
         save_torch_atomic(str(directory / BUNDLE_FILE), payload)
-        save_json_atomic(str(directory / LOG_FILE), {"meta": self.meta, "rho": self.rho, "tau": self.tau, **self.log})
+        save_json_atomic(
+            str(directory / LOG_FILE),
+            {"meta": self.meta, "rho": self.rho, "tau": self.tau, "bandwidth": self.bandwidth, **self.log},
+        )
         return directory
 
     @classmethod
@@ -440,6 +507,7 @@ class RouterTrainer:
             numeric_stats=payload["numeric_stats"],
             rho=float(payload["rho"]),
             tau=float(payload["tau"]),
+            bandwidth=float(payload["bandwidth"]),
             catalog_ids=list(payload["catalog_ids"]),
             train_apps=apps("train_apps"),
             val_apps=apps("val_apps"),
@@ -454,7 +522,7 @@ class RouterTrainer:
 # --------------------------------------------------------------------------- #
 # Leave-one-dataset-out router for one target group
 # --------------------------------------------------------------------------- #
-def _validation_groups(
+def validation_groups(
     router_cfg,
     target_group: str,
     apps: Sequence[AppSpec],
@@ -463,9 +531,12 @@ def _validation_groups(
 ) -> List[str]:
     """Held-out validation groups.
 
-    ``router.val_datasets`` (minus the target group) if given, else the first
+    ``router.val_datasets`` (minus the target group) if given, else up to
     ``num_val_datasets`` groups in declaration order, groups with an
-    application of a target task family first.
+    application of a target task family first. An automatic choice never
+    takes the last training group of a target task family (e.g. QM9 for a
+    QM7b target), so the router is always trained on the target's loss family
+    when history has one.
     """
     available = list(dict.fromkeys(a.group for a in apps))
     configured = [g for g in dict.fromkeys(_group_of(n) for n in router_cfg.val_datasets) if g != target_group]
@@ -475,15 +546,28 @@ def _validation_groups(
             raise ValueError(f"Validation datasets without historical applications: {missing}")
         groups = configured
     else:
-        shared = {a.group for a in apps if families[a.key] in target_families}
-        groups = sorted(available, key=lambda g: g not in shared)[: int(router_cfg.num_val_datasets)]
+        family_groups = {f: {a.group for a in apps if families[a.key] == f} for f in target_families}
+        shared = set().union(*family_groups.values()) if family_groups else set()
+        groups = []
+        for g in sorted(available, key=lambda g: g not in shared):
+            if len(groups) == int(router_cfg.num_val_datasets):
+                break
+            if all(members - set(groups) - {g} for members in family_groups.values() if members):
+                groups.append(g)
     if not groups or len(groups) >= len(available):
         raise ValueError(f"Cannot split {available} into training and validation groups (validation: {groups}).")
     return groups
 
 
 def build_router_trainer(
-    cfg, target_group: str, budget: int, provider=None, seed: Optional[int] = None, device=None
+    cfg,
+    target_group: str,
+    budget: int,
+    provider=None,
+    seed: Optional[int] = None,
+    device=None,
+    *,
+    exclude_experts: Sequence[str] = (),
 ) -> RouterTrainer:
     """RouterTrainer for one target group and budget, built from the history of every other group.
 
@@ -492,6 +576,9 @@ def build_router_trainer(
     validation groups' applications at ``budget``. H and M contain the training
     and validation groups, never the target group. The descriptor standardizer
     is fitted on the training applications' diagnostic descriptors only.
+    ``exclude_experts`` are left out of the catalog, so H has no node or edge
+    of theirs (nor an arch/objective node used only by them) and M no record;
+    the applications and the standardizer do not change.
     """
     from ..infra import RouterInfra
 
@@ -499,27 +586,33 @@ def build_router_trainer(
     target_group = _group_of(target_group)
     seed = int(rg.router.seed if seed is None else seed)
     infra = RouterInfra(cfg, provider, device)
+    excluded = sorted({str(e) for e in exclude_experts})
+    catalog = [s for s in infra.catalog if s.expert_id not in excluded]
     declared = enumerate_applications(rg)
     history = [a for a in declared if a.group != target_group and infra.store.expert_ids(a.data_key)]
     families = {a.key: infra.task_family(a) for a in history}
     target_families = {infra.task_family(a) for a in declared if a.group == target_group}
-    val_groups = _validation_groups(rg.router, target_group, history, families, target_families)
+    val_groups = validation_groups(rg.router, target_group, history, families, target_families)
     apps_train = [a for a in history if a.group not in val_groups]
     val_context = [a for a in history if a.group in val_groups]
     apps_val = [a for a in val_context if a.budget == int(budget)]
     context = apps_train + val_context
 
     descriptors: Dict[str, Dict[str, Any]] = {}
+    by_set: Dict[str, Dict[str, Any]] = {}  # one in-memory cache per instance set (shared by its data keys)
     for app in context:
         if app.data_key not in descriptors:
-            descriptors[app.data_key] = ensure_descriptors(cfg, infra.data(app))
+            cache = by_set.get(instance_set_key(app))
+            if cache is None or app.data_key not in cache["data_keys"]:
+                cache = by_set[instance_set_key(app)] = ensure_descriptors(cfg, infra.data(app))
+            descriptors[app.data_key] = cache
     train_keys = {a.data_key: a for a in apps_train}
     Z = torch.cat([descriptors_at(descriptors[k], infra.data(a).diag_pos) for k, a in train_keys.items()])
     standardizer = DescriptorStandardizer(clip=float(rg.descriptors.clip)).fit(Z)
-    archive = build_archive(context, infra.store, standardizer, cfg, catalog=infra.catalog, descriptors=descriptors)
+    archive = build_archive(context, infra.store, standardizer, cfg, catalog=catalog, descriptors=descriptors)
     graph = build_context_graph(
         cfg,
-        infra.catalog,
+        catalog,
         context,
         infra.store,
         infra.text_encoder,
@@ -532,12 +625,12 @@ def build_router_trainer(
         "seed": seed,
         "run_key": router_run_key(target_group, budget, seed),
         "val_groups": list(val_groups),
-        "cfg_hash": stable_hash(
-            {k: cfg_to_dict(rg[k]) for k in ("router", "descriptors", "archive", "graph", "heads", "loss")}
-        ),
+        "cfg_hash": router_cfg_hash(cfg),
     }
+    if excluded:
+        meta["hidden_experts"] = excluded
     return RouterTrainer(
-        cfg, infra.catalog, apps_train, apps_val, infra.store, graph, archive, standardizer, descriptors,
+        cfg, catalog, apps_train, apps_val, infra.store, graph, archive, standardizer, descriptors,
         infra.device, provider=infra.provider, seed=seed, meta=meta,
     )
 
@@ -552,12 +645,12 @@ def train_router(cfg, target_group: str, budget: int, provider=None, seed: Optio
     group = _group_of(target_group)
     seed = int(rg.router.seed if seed is None else seed)
     directory = RouterPaths.from_cfg(cfg).router_dir(router_run_key(group, budget, seed))
-    if bool(rg.router.skip_if_exists) and (directory / BUNDLE_FILE).is_file():
+    if reusable_bundle(cfg, directory):
         print(f"[RouterGFM router] reuse {directory}", flush=True)
         return directory
     trainer = build_router_trainer(cfg, group, budget, provider, seed)
     trainer.fit()
-    trainer.select_rho_tau()
+    trainer.select_integration_params()
     return trainer.save(directory)
 
 
@@ -567,6 +660,9 @@ __all__ = [
     "RouterBundle",
     "RouterTrainer",
     "build_router_trainer",
+    "reusable_bundle",
+    "router_cfg_hash",
     "router_run_key",
     "train_router",
+    "validation_groups",
 ]

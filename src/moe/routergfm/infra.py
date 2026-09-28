@@ -18,7 +18,7 @@ import torch
 from src.utils.checkpoint import save_torch_atomic
 from src.utils.metrics import compute_supervised_metrics
 
-from .applications import AppData, DataProvider, RealDataProvider
+from .applications import AppData, DataProvider, RealDataProvider, instance_set_key
 from .common import AppSpec, RouterPaths, enumerate_applications, parse_dataset_spec
 from .descriptors import descriptors_at, ensure_descriptors
 from .experts import build_expert_catalog, compatible_experts, load_frozen_encoder
@@ -99,23 +99,29 @@ class RouterInfra:
         return self._encoder[1]
 
     def embeddings(self, app: AppSpec, expert_id: str, split: str) -> torch.Tensor:
-        """Frozen-encoder task readout of ``data.<split>_pos`` (float32; float16 disk cache).
+        """Frozen-encoder task readout of ``data.<split>_pos`` (float32, cached on disk as float32).
 
-        Support embeddings come from the history record when one exists.
+        Support embeddings come from the history record when one exists. Older
+        float16 caches are upcast; a cache or record holding non-finite values
+        (float16 overflow of large activations) is recomputed.
         """
         if split not in SPLITS:
             raise ValueError(f"Unknown split {split!r} (expected one of {SPLITS}).")
         path = self._embedding_file(app.data_key, expert_id, split)
         if path.is_file():
-            return torch.load(path, map_location="cpu").float()
+            emb = torch.load(path, map_location="cpu").float()
+            if bool(torch.isfinite(emb).all()):
+                return emb
         if split == "support" and self.store.has(app.data_key, expert_id):
-            return self.store.load(app.data_key, expert_id)["support_emb"].float()
+            emb = self.store.load(app.data_key, expert_id)["support_emb"].float()
+            if bool(torch.isfinite(emb).all()):
+                return emb
         encoder, model_cfg = self._load_encoder(expert_id)
         spec = self.catalog[self.expert_index[expert_id]]
         batch_size = int(self.cfg.moe.routergfm.device_batch_size)
-        emb = embed_splits(encoder, model_cfg, spec, self.data(app), (split,), self.device, batch_size)[split].half()
+        emb = embed_splits(encoder, model_cfg, spec, self.data(app), (split,), self.device, batch_size)[split]
         save_torch_atomic(str(path), emb)
-        return emb.float()
+        return emb
 
     def support_labels(self, app: AppSpec) -> torch.Tensor:
         """Support labels (long classes; float with NaN-missing assays; raw-unit regression targets)."""
@@ -136,14 +142,19 @@ class RouterInfra:
     def descriptors(self, app: AppSpec, split: str) -> torch.Tensor:
         """Raw (unstandardized) descriptors z_a(x) of ``data.<split>_pos``."""
         data = self.data(app)
-        if app.data_key not in self._descriptors:
-            self._descriptors[app.data_key] = ensure_descriptors(self.cfg, data)
-        return descriptors_at(self._descriptors[app.data_key], getattr(data, f"{split}_pos"))
+        key = instance_set_key(app)  # one cache per instance set, as on disk
+        if app.data_key not in self._descriptors.get(key, {}).get("data_keys", ()):
+            self._descriptors[key] = ensure_descriptors(self.cfg, data)
+        return descriptors_at(self._descriptors[key], getattr(data, f"{split}_pos"))
 
     def instance_graphs(self, app: AppSpec, split: str) -> Sequence[Any]:
         """The PyG (sub)graphs of ``data.<split>_pos`` without labels."""
         data = self.data(app)
         return _UnlabeledInstances(data.dataset, getattr(data, f"{split}_pos"))
+
+    def base_graph(self, app: AppSpec) -> Any:
+        """Structure-only input graph of a node / link application (``DataProvider.base_graph``; no labels)."""
+        return self.provider.base_graph(app)
 
     @property
     def text_encoder(self):

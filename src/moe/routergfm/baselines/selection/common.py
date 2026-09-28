@@ -157,13 +157,15 @@ class _GuardedStore:
 class QueryGuard:
     """``RouterInfra`` view handed to selectors (they never read query data).
 
-    Evaluation helpers always raise. While ``target`` is set, applications of the
-    target's group expose only label-free and support-side data: ``data`` keeps
-    support labels only, ``embeddings`` only the support split, and history
-    records, fitted query predictions, and ``historical_mu`` raise.
+    Evaluation helpers, the raw provider, and private attributes always raise.
+    While ``target`` is set, applications of the target's group expose only
+    support-side and label-free data: ``data`` keeps support labels only,
+    ``embeddings`` only the support split, and history records, fitted
+    predictions, and ``historical_mu`` raise. Label-free inputs
+    (``descriptors``, ``instance_graphs``, metadata) stay available.
     """
 
-    _EVAL_ONLY = frozenset({"query_expert_risk", "evaluate_outputs", "provider"})
+    _ALWAYS_BLOCKED = frozenset({"query_expert_risk", "evaluate_outputs", "provider"})
     _TARGET_BLOCKED = frozenset({"historical_mu", "expert_predictions"})
 
     def __init__(self, infra):
@@ -177,7 +179,7 @@ class QueryGuard:
     def __getattr__(self, name: str):
         if name.startswith("__"):
             raise AttributeError(name)
-        if name.startswith("_") or name in self._EVAL_ONLY:
+        if name.startswith("_") or name in self._ALWAYS_BLOCKED:
             raise QueryAccessError(f"RouterInfra.{name} is not available to selectors.")
         if name == "store":
             return _GuardedStore(self._infra.store, self)
@@ -242,7 +244,9 @@ def append_selection_rows(
     ``per_app``: ``(outcome, episode metrics, task family)``. Rows carry
     ``<metric>_mean/_std`` over the applications (``aggregate_run_metrics``),
     ``n_apps``, and the seeds. The ``table9_all`` row pools node and
-    single-label graph classification applications (Table 9 scope).
+    single-label graph classification applications (Table 9 scope); it is
+    written only when they span at least two datasets, so a single-dataset
+    invocation (one SLURM row) never produces a misleading pooled row.
     """
     k = int(cfg.moe.routergfm.baselines.topk)
     groups: Dict[Tuple[str, str, int], List[Tuple[SelectionOutcome, Mapping[str, float], str]]] = {}
@@ -251,7 +255,7 @@ def append_selection_rows(
         groups.setdefault((app.dataset, app.task_level, int(app.budget)), []).append(item)
     for budget in sorted({key[2] for key in groups}):
         pooled = [it for key, items in groups.items() if key[2] == budget for it in items if it[2] in TABLE9_FAMILIES]
-        if pooled:
+        if len({(it[0].app.dataset, it[0].app.task_level) for it in pooled}) >= 2:
             groups[(TABLE9_ROW, "", budget)] = pooled
 
     identity = {

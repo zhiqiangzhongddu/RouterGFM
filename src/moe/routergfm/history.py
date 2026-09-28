@@ -12,11 +12,14 @@ deployment.
 from __future__ import annotations
 
 import os
+import time
 from collections import OrderedDict
+from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 
+from src.data_loader.induced_graphs import _acquire_induced_cache_build_lock, _release_induced_cache_build_lock
 from src.utils.checkpoint import save_torch_atomic
 
 from .applications import AppData, derive_seed, instance_set_key
@@ -33,23 +36,33 @@ _MATRIX_STEM = "_matrix"  # consolidated per-data-key cache next to the records
 # history, predict_queries, and cached embeddings all see identical batches.
 BATCH_DEPENDENT_ARCHITECTURES = ("nodeformer",)
 _PRED_KEYS = ("pred", "support_pred", "support_oof_pred")
+_REFRESH_SECONDS = 1.0  # a record directory's mtime is checked at most this often per store
+# Directory mtimes can be coarse (1 s on Lustre): a listing taken within this
+# long of the directory's last change is re-read at the next check.
+_MTIME_SLACK_NS = 2_000_000_000
 
 
 def _device(cfg) -> torch.device:
     return torch.device(f"cuda:{cfg.device}" if torch.cuda.is_available() else "cpu")
 
 
+def _load_matrix(path) -> Optional[Dict[str, Any]]:
+    """Memory-mapped ``_matrix.pt`` (page-cache backed, not a heap copy), or None when absent."""
+    return torch.load(str(path), map_location="cpu", mmap=True) if path.is_file() else None
+
+
 # --------------------------------------------------------------------------- #
 # Shared fitting procedure (history, predict_queries, RouterInfra)
 # --------------------------------------------------------------------------- #
 def head_cfg_hash(cfg) -> str:
-    """Identity of the head-fitting procedure (head block, scale floor, embedding batch size)."""
+    """Identity of the head-fitting procedure (head block, scale floor, embedding batch size, OOF normalization)."""
     rg = cfg.moe.routergfm
     return stable_hash(
         {
             "heads": dict(rg.heads),
             "scale_floor": float(rg.loss.scale_floor),
             "batch_size": int(rg.device_batch_size),
+            "oof_normalizer": "per_fold",  # regression OOF heads normalize with their own training labels
         }
     )
 
@@ -79,6 +92,11 @@ def fit_expert_head(
         normalizer=normalizer,
         device=device,
     )
+
+
+def stored_predictions(pred: torch.Tensor, family: str) -> torch.Tensor:
+    """Predictions as stored: float16 for bounded probabilities, float32 for unbounded regression outputs."""
+    return pred.float() if family == REGRESSION else pred.half()
 
 
 def instance_losses(cfg, pred: torch.Tensor, target: torch.Tensor, family: str, normalizer=None) -> torch.Tensor:
@@ -142,45 +160,72 @@ def embed_splits(
 # --------------------------------------------------------------------------- #
 # Store
 # --------------------------------------------------------------------------- #
+@dataclass
+class _Listing:
+    """Cached expert ids of one ``history/<data_key>`` directory."""
+
+    ids: List[str]
+    members: set
+    mtime: Optional[int]  # directory st_mtime_ns when listed (None: no directory yet)
+    settled: bool  # listed >= _MTIME_SLACK_NS after that mtime: later writes must change it
+    checked: float  # time.monotonic() of the last freshness check
+
+
 class HistoryStore:
     """Records at ``RouterPaths.history_file(data_key, expert_id)`` plus a consolidated matrix per data key.
 
     Records are write-once. ``<root>/history/<data_key>/_matrix.pt`` stacks the
-    diagnostic losses (float32, NaN = invalid) and predictions (float16) of every
+    diagnostic losses (float32, NaN = invalid) and predictions (``stored_predictions``) of every
     recorded expert; it is rebuilt (reusing unchanged columns) when the expert
     set on disk differs from the one it was built from. Directory listings and
-    matrices are cached per store instance.
+    matrices are cached per store instance and refreshed when the directory
+    changes (mtime checked at most every ``_REFRESH_SECONDS``), so a
+    long-running process sees records that other shards write meanwhile.
     """
 
     def __init__(self, paths: RouterPaths):
         self.paths = paths
-        self._ids: Dict[str, Tuple[List[str], set]] = {}
-        self._matrices: Dict[str, Dict[str, Any]] = {}
+        self._ids: Dict[str, _Listing] = {}
+        self._matrices: Dict[str, Tuple[List[str], Dict[str, Any]]] = {}  # (listing ids it was built for, matrix)
         self._columns: Dict[str, Dict[str, int]] = {}
 
     def _matrix_file(self, data_key: str):
         return self.paths.history_file(data_key, _MATRIX_STEM)
 
-    def _listing(self, data_key: str) -> Tuple[List[str], set]:
-        if data_key not in self._ids:
-            directory = self._matrix_file(data_key).parent
-            names = os.listdir(directory) if directory.is_dir() else []
-            ids = sorted(n[:-3] for n in names if n.endswith(".pt") and not n.startswith((".", "_")))
-            self._ids[data_key] = (ids, set(ids))
+    def _listing(self, data_key: str) -> _Listing:
+        entry = self._ids.get(data_key)
+        now = time.monotonic()
+        if entry is not None and now - entry.checked < _REFRESH_SECONDS:
+            return entry
+        directory = self._matrix_file(data_key).parent
+        listed_at = time.time_ns()
+        try:
+            mtime = os.stat(directory).st_mtime_ns
+        except FileNotFoundError:
+            mtime = None
+        if entry is not None and entry.settled and entry.mtime == mtime:
+            entry.checked = now
+            return entry
+        names = os.listdir(directory) if mtime is not None else []
+        ids = sorted(n[:-3] for n in names if n.endswith(".pt") and not n.startswith((".", "_")))
+        if entry is not None and ids == entry.ids:
+            ids = entry.ids  # unchanged expert set: keep the cached matrix valid
+        settled = mtime is None or listed_at - mtime >= _MTIME_SLACK_NS
+        self._ids[data_key] = _Listing(ids, set(ids), mtime, settled, now)
         return self._ids[data_key]
 
     def expert_ids(self, data_key: str) -> List[str]:
         """Experts with a record on *data_key* (sorted)."""
-        return list(self._listing(data_key)[0])
+        return list(self._listing(data_key).ids)
 
     def has(self, data_key: str, expert_id: str) -> bool:
-        return expert_id in self._listing(data_key)[1]
+        return expert_id in self._listing(data_key).members
 
     def save(self, data_key: str, expert_id: str, record: Dict[str, Any]) -> None:
         save_torch_atomic(str(self.paths.history_file(data_key, expert_id)), record)
-        ids = sorted(self._listing(data_key)[1] | {expert_id})
-        self._ids[data_key] = (ids, set(ids))
-        self._matrices.pop(data_key, None)
+        entry = self._listing(data_key)
+        entry.ids = sorted(entry.members | {expert_id})  # the changed mtime triggers a re-list later
+        entry.members = set(entry.ids)
 
     def load(self, data_key: str, expert_id: str) -> Dict[str, Any]:
         """One record; tensors are memory-mapped, so reading a few fields stays cheap."""
@@ -189,16 +234,27 @@ class HistoryStore:
     # -- consolidated matrix -------------------------------------------------
     def matrix(self, data_key: str) -> Dict[str, Any]:
         """``{'expert_ids', 'diag_pos', 'family', 'num_classes', 'loss' [n, E], 'pred' [n, E, C], 'mu' [E], 'count' [E]}``."""
-        if data_key in self._matrices:
-            return self._matrices[data_key]
-        ids = self.expert_ids(data_key)
+        ids = self._listing(data_key).ids
+        built = self._matrices.get(data_key)
+        if built is not None and built[0] is ids:
+            return built[1]
         path = self._matrix_file(data_key)
-        cached = torch.load(str(path), map_location="cpu", mmap=True) if path.is_file() else None
+        cached = _load_matrix(path)
         if cached is None or list(cached["expert_ids"]) != ids:
-            cached = self._build_matrix(data_key, ids, cached)
-            if ids:
-                save_torch_atomic(str(path), cached)
-        self._matrices[data_key] = cached
+            if not ids:
+                cached = self._build_matrix(data_key, ids, cached)
+            else:
+                # One process rebuilds a stale matrix; concurrent readers wait and then
+                # memory-map the saved file instead of keeping a heap copy.
+                lock = _acquire_induced_cache_build_lock(path)
+                try:
+                    cached = _load_matrix(path)
+                    if cached is None or list(cached["expert_ids"]) != ids:
+                        save_torch_atomic(str(path), self._build_matrix(data_key, ids, cached))
+                        cached = _load_matrix(path)
+                finally:
+                    _release_induced_cache_build_lock(lock)
+        self._matrices[data_key] = (ids, cached)
         self._columns[data_key] = {e: i for i, e in enumerate(cached["expert_ids"])}
         return cached
 
@@ -215,7 +271,7 @@ class HistoryStore:
         for eid in ids:
             if eid in old_col:
                 losses.append(old["loss"][:, old_col[eid]])
-                preds.append(old["pred"][:, old_col[eid]])
+                preds.append(stored_predictions(old["pred"][:, old_col[eid]], str(old["family"])))
                 continue
             record = self.load(data_key, eid)
             if ref is None:
@@ -223,7 +279,7 @@ class HistoryStore:
             elif not torch.equal(record["diag_pos"], ref["diag_pos"]):
                 raise ValueError(f"{data_key}: record {eid} was built on different diagnostic positions (stale history).")
             losses.append(record["loss"].float())
-            preds.append(record["pred"].half())
+            preds.append(stored_predictions(record["pred"], str(record["family"])))
         loss = torch.stack(losses, dim=1)
         valid = torch.isfinite(loss)
         count = valid.sum(dim=0)
@@ -289,7 +345,7 @@ def _history_record(cfg, data: AppData, expert_id: str, emb_support, emb_diag, d
         "expert_id": expert_id,
         "data_key": data.app.data_key,
         "diag_pos": data.diag_pos.clone(),
-        "pred": pred.half(),
+        "pred": stored_predictions(pred, data.task_family),
         "loss": loss,
         "mu": float(loss[valid].mean()) if count else float("nan"),
         "count": count,
@@ -298,7 +354,7 @@ def _history_record(cfg, data: AppData, expert_id: str, emb_support, emb_diag, d
         "normalizer": normalizer.state_dict() if normalizer is not None else None,
         "support_pos": data.support_pos.clone(),
         "support_size": int(data.support_pos.numel()),
-        "support_emb": emb_support.half(),
+        "support_emb": emb_support.float(),
         "head_cfg_hash": head_cfg_hash(cfg),
     }
 
@@ -311,7 +367,8 @@ def generate_history(cfg, provider=None, *, apps: Optional[Sequence[AppSpec]] = 
     are skipped. Each built dataset (instance set) is loaded once; per expert,
     the union of the support and diagnostic positions of all its pending data
     keys is embedded once, then a head is fitted per data key. Shard 0 also
-    ensures the (expert-independent) descriptors of every data key.
+    ensures the (expert-independent) descriptors of every data key, cached
+    once per instance set.
     """
     from .applications import RealDataProvider
     from .descriptors import ensure_descriptors
@@ -383,7 +440,8 @@ def predict_queries(cfg, app: AppSpec, expert_ids: Sequence[str], provider=None)
     Entries: ``query_pos``, ``pred`` [|Q_a|, C], ``support_pos``,
     ``support_pred`` (in-sample), ``support_oof_pred`` (each support item
     predicted by a fold head not trained on it), in the family's prediction
-    space as float32 (stored float16). Heads are refitted exactly as in
+    space as float32 (stored as ``stored_predictions``; a cache holding
+    non-finite values is recomputed). Heads are refitted exactly as in
     :func:`generate_history`. Only support labels are read.
     """
     from .applications import RealDataProvider
@@ -397,7 +455,7 @@ def predict_queries(cfg, app: AppSpec, expert_ids: Sequence[str], provider=None)
         path = paths.prediction_file(app.data_key, eid)
         if path.is_file():
             cached = torch.load(path, map_location="cpu")
-            if cached.get("head_cfg_hash") == digest:
+            if cached.get("head_cfg_hash") == digest and all(torch.isfinite(cached[k]).all() for k in _PRED_KEYS):
                 out[eid] = cached
     missing = [e for e in wanted if e not in out]
     if missing:
@@ -416,10 +474,10 @@ def predict_queries(cfg, app: AppSpec, expert_ids: Sequence[str], provider=None)
             )
             payload = {
                 "query_pos": data.query_pos.clone(),
-                "pred": predict_head(head, emb["query"]).half(),
+                "pred": stored_predictions(predict_head(head, emb["query"]), data.task_family),
                 "support_pos": data.support_pos.clone(),
-                "support_pred": predict_head(head, emb["support"]).half(),
-                "support_oof_pred": oof.half(),
+                "support_pred": stored_predictions(predict_head(head, emb["support"]), data.task_family),
+                "support_oof_pred": stored_predictions(oof, data.task_family),
                 "family": data.task_family,
                 "normalizer": normalizer.state_dict() if normalizer is not None else None,
                 "head_cfg_hash": digest,
@@ -442,4 +500,5 @@ __all__ = [
     "head_seed",
     "instance_losses",
     "predict_queries",
+    "stored_predictions",
 ]

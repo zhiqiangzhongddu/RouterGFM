@@ -39,6 +39,8 @@ from src.moe.ogmm.merge import (
 )
 from src.moe.ogmm.run import _build_task_cfg, parse_ogmm_tasks, run_ogmm
 from src.moe.ogmm.trainer import OGMMRunner
+from src.moe.routergfm.common import REGRESSION
+from src.moe.shift_eval import brier_risk
 from src.utils.supervised_loss import supervised_loss_from_logits
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -545,6 +547,17 @@ class OGMMRunnerTest(unittest.TestCase):
         self.assertFalse(any(id(g) in real for g in record["merged_on"]))
         self.assertFalse(loaders["val"].open)
 
+    def test_reruns_are_deterministic(self):
+        graphs = _instances("edge", count=14)
+        preds = []
+        for _ in range(2):
+            _, patcher = _patched_trainer(graphs, _META["edge"][0])
+            with tempfile.TemporaryDirectory() as tmp, patcher:
+                runner = OGMMRunner(_tiny(tmp, "edge"))
+                runner.fit()
+                preds.append(runner.query_outputs["pred"])
+        self.assertTrue(torch.equal(preds[0], preds[1]))
+
     def test_small_support_falls_back_to_one_domain_and_clamps_top_k(self):
         graphs = _instances("graph", count=7, family="regression")
         _, patcher = _patched_trainer(graphs, _META["regression"][0], n_support=3)
@@ -561,6 +574,7 @@ class OGMMRunnerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, patcher:
             cfg = _tiny(tmp, "graph")
             cfg.data_preparation.dataset.split_root = "data/splits_shift/structural"
+            cfg.data_preparation.shift.root = os.path.join(tmp, "shift")  # recorded only; guard tested below
             self.assertEqual(run_ogmm(cfg), 0)
             lines = (Path(tmp) / "results" / "moe_ogmm.tsv").read_text(encoding="utf-8").splitlines()
             self.assertIn("data_preparation.dataset.split_root", lines[0])
@@ -593,6 +607,76 @@ class OGMMRunnerTest(unittest.TestCase):
             cfg.moe.ogmm.dataset.induced = False
             with self.assertRaisesRegex(ValueError, "induced"):
                 OGMMRunner(cfg)
+
+    def test_regression_trains_on_normalized_targets_and_reports_raw_units(self):
+        graphs = _instances("graph", count=14, family="regression")
+        gen = torch.Generator().manual_seed(5)
+        for graph in graphs:
+            graph.y = 1000.0 + 100.0 * torch.randn(1, 2, generator=gen)  # QM7b-like target scale
+        _, patcher = _patched_trainer(graphs, _META["regression"][0])
+        seen, real_loss = [], OGMMRunner._loss
+
+        def record(runner, logits, labels):
+            seen.append(labels.detach().cpu())
+            return real_loss(runner, logits, labels)
+
+        with tempfile.TemporaryDirectory() as tmp, patcher, patch.object(OGMMRunner, "_loss", record):
+            runner = OGMMRunner(_tiny(tmp, "graph"))
+            runner.fit()
+        self.assertTrue(seen and float(torch.cat(seen).abs().median()) < 5.0)  # unit-scale expert targets
+        self.assertTrue(all(float(g.y.abs().max()) > 500.0 for g in graphs))  # dataset items are untouched
+        support = torch.cat([graph.y for graph in graphs[:8]])
+        pred = runner.query_outputs["pred"]
+        self.assertLess(abs(float(pred.mean()) - float(support.median())), 500.0)  # raw-unit outputs
+        zero = brier_risk(
+            {"pred": torch.zeros_like(pred), "y": runner.query_outputs["y"]}, task_family=REGRESSION,
+            support_targets=support,
+        )
+        self.assertLess(runner.best_metrics["test_brier"], zero)
+        self.assertLess(runner.best_metrics["test_mae"], 500.0)
+
+    def test_brier_uses_configured_regression_loss(self):
+        graphs = _instances("graph", count=14, family="regression")
+        _, patcher = _patched_trainer(graphs, _META["regression"][0])
+        with tempfile.TemporaryDirectory() as tmp, patcher, patch(
+            "src.moe.ogmm.trainer.brier_risk", return_value=0.5
+        ) as spy:
+            cfg = _tiny(tmp, "graph")
+            cfg.moe.routergfm.loss.regression = "sq"
+            OGMMRunner(cfg).fit()
+        self.assertEqual(spy.call_args.kwargs["reg_kind"], "sq")
+
+
+class ShiftRootGuardTest(unittest.TestCase):
+    def _shift_cfg(self, tmp):
+        cfg = _tiny(tmp, "node")
+        cfg.data_preparation.shift.root = os.path.join(tmp, "shift")
+        cfg.data_preparation.dataset.split_root = os.path.join(tmp, "shift", "structural")
+        return cfg
+
+    def test_missing_shift_file_fails_before_loading(self):
+        graphs = _instances("node", count=14)
+        _, patcher = _patched_trainer(graphs, _META["node"][0])
+        with tempfile.TemporaryDirectory() as tmp, patcher, patch("src.moe.ogmm.trainer.create_dataset") as create:
+            with self.assertRaisesRegex(ValueError, "missing"):
+                OGMMRunner(self._shift_cfg(tmp)).fit()
+            create.assert_not_called()
+
+    def test_intact_shift_file_passes_and_standard_file_is_rejected(self):
+        from src.data_loader.shift_splits import SHIFT_SPLIT_TYPE, split_file_path
+
+        graphs = _instances("node", count=14)
+        _, patcher = _patched_trainer(graphs, _META["node"][0])
+        with tempfile.TemporaryDirectory() as tmp, patcher:
+            cfg = self._shift_cfg(tmp)
+            path = split_file_path(cfg.data_preparation.dataset.split_root, "toy", "node", 42, (4, 0.0, 1.0))
+            path.parent.mkdir(parents=True)
+            torch.save({"train": [0, 1], "val": [2], "test": [3, 4],
+                        "meta": {"type": SHIFT_SPLIT_TYPE, "condition": "structural", "total": 5}}, path)
+            OGMMRunner(cfg).fit()
+            torch.save({"train": [0, 1], "val": [2], "test": [3, 4], "meta": {"total": 5}}, path)
+            with self.assertRaisesRegex(ValueError, "not a shift split"):
+                OGMMRunner(cfg).fit()
 
 
 # --------------------------------------------------------------------------- #

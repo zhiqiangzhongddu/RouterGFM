@@ -15,7 +15,7 @@ import importlib
 from datetime import datetime
 from typing import Any, Dict, Tuple
 
-from ..run import baseline_seeds, baseline_tasks, method_config, result_dir
+from ..run import baseline_seeds, baseline_tasks, config_value, identity_paths, result_dir
 from .common import (
     QueryGuard,
     append_selection_rows,
@@ -110,7 +110,8 @@ def run_selection_baseline(cfg, *, infra=None) -> int:
         return 0
     append_selection_rows(
         cfg, method, per_app, started_at, datetime.now().astimezone(),
-        config=method_config(cfg, block), config_hash=out_dir.name,
+        config={path: config_value(cfg, path) for path in identity_paths(cfg, method, block)},
+        config_hash=out_dir.name,
     )
     return 0
 

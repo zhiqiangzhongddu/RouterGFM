@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,12 +15,16 @@ import torch
 
 from src.moe.routergfm.baselines import BASELINE_RUNNERS, config_block_name
 from src.moe.routergfm.baselines import run as matched_run
+from src.moe.routergfm.baselines.candidates import CANDIDATE_RULES, candidate_experts
+from src.moe.routergfm.baselines.meta_des import runner as meta_des_runner
+from src.moe.routergfm.baselines.sagmm_pe import trainer as sagmm_trainer
 from src.moe.routergfm.baselines.selection import run as selection_run
 from src.moe.routergfm.baselines.selection.common import (
     ColumnScaler,
     QueryAccessError,
     QueryGuard,
     SelectionOutcome,
+    append_selection_rows,
     block_concat,
     episode_metrics,
     selection_metrics,
@@ -46,6 +51,7 @@ from src.moe.routergfm.common import AppSpec, enumerate_applications, parse_data
 from src.moe.routergfm.context_graph import APP_NUMERIC_NAMES
 from src.moe.routergfm.history import HistoryStore, generate_history
 from src.moe.routergfm.infra import RouterInfra
+from src.utils.save_results import set_explicit_cfg_keys
 from tests.routergfm.fixtures import SyntheticDataProvider, tiny_cfg
 
 TARGET = "nodea:node"
@@ -121,15 +127,21 @@ def test_logme_matches_algorithm1_reference():
 
 def test_logme_scale_invariance_and_standardize_flag():
     f, y = _classification(n_per_class=30)
-    tight = dict(standardize=False, max_iter=2000, tol=1e-13)  # invariance holds at the fixed point
-    for c in (0.01, 7.3):
-        assert logme_score(c * f, y, **tight) == pytest.approx(logme_score(f, y, **tight), abs=1e-10)
     base = logme_score(f, y, standardize=False)
+    # Exact invariances, but float32 features fix the (float64) score only to float32 resolution:
+    # rescaling or shifting in float32 rounds every input by up to eps32 (observed ~1e-8 relative).
+    # Features are rescaled to unit RMS first, so the official 1e-5 update epsilons cannot break
+    # scale invariance on large-norm readouts.
+    rel = torch.finfo(torch.float32).eps
+    base64 = logme_score(f.double(), y, standardize=False)
+    for c in (0.01, 7.3, 1e2, 1e4):
+        assert logme_score(c * f, y, standardize=False) == pytest.approx(base, rel=rel)
+        assert logme_score(c * f.double(), y, standardize=False) == pytest.approx(base64, rel=1e-10)
     shifted = f.clone()
     shifted[:, 0] += 5.0  # no bias term: an offset changes the paper/official score ...
     assert abs(logme_score(shifted, y, standardize=False) - base) > 1e-6
     # ... but not the legacy z-scored variant.
-    assert logme_score(shifted, y, standardize=True) == pytest.approx(logme_score(f, y, standardize=True), abs=1e-9)
+    assert logme_score(shifted, y, standardize=True) == pytest.approx(logme_score(f, y, standardize=True), rel=rel)
 
 
 def test_logme_skips_degenerate_float_columns_and_few_shot():
@@ -146,6 +158,23 @@ def test_logme_skips_degenerate_float_columns_and_few_shot():
     feats, labels = _classification(n_per_class=5, d=128, classes=4, noise=0.05)
     informative = logme_score(feats, labels, standardize=False)
     assert math.isfinite(informative) and informative > logme_score(torch.randn_like(feats), labels, standardize=False)
+
+
+def test_logme_degenerate_five_shot_targets_stay_finite():
+    """n = 5 < d = 16 and a target (numerically) orthogonal to the features: without the official
+    epsilons alpha grows geometrically until ``alpha ** 2`` overflows (real 5-shot supports)."""
+    g = torch.Generator().manual_seed(0)
+    f = torch.zeros(5, 16, dtype=torch.float64)
+    f[:2] = torch.randn(2, 16, generator=g, dtype=torch.float64)
+    f[2:] = 1e-9 * torch.randn(3, 16, generator=g, dtype=torch.float64)  # near-dead readouts
+    targets = (
+        torch.tensor([0.0, 0.0, 1.0, -1.0, 0.5], dtype=torch.float64),  # lives on the near-dead rows
+        torch.tensor([0, 0, 1, 2, 1]),  # classes 1 and 2 are separated by the near-dead rows only
+    )
+    for y in targets:
+        assert math.isfinite(logme_score(f, y, standardize=False))
+    interpolated = torch.randn(5, 16, generator=g, dtype=torch.float64)  # full rank: beta -> inf without eps
+    assert math.isfinite(logme_score(interpolated, torch.randn(5, generator=g, dtype=torch.float64), standardize=False))
 
 
 def test_to_logme_targets():
@@ -477,9 +506,10 @@ def test_run_selection_baseline_rows_and_label_access(env, tmp_path, method):
         assert target_reads == set()
 
     rows = _read_tsv(tmp_path / "results" / "moe_routergfm_selection.tsv")
-    assert [(r["dataset"], r["budget"], r["n_apps"]) for r in rows] == [("nodea", "3", "2"), ("table9_all", "3", "2")]
+    assert [(r["dataset"], r["budget"], r["n_apps"]) for r in rows] == [("nodea", "3", "2")]  # one dataset: no pooled row
     row = rows[0]
     assert row["moe.routergfm.baselines.method"] == method and row["topk"] == "2"
+    assert set(json.loads(row["config"])) == set(matched_run.identity_paths(cfg, method, method))
     assert json.loads(row["seeds"]) == [0, 42]
     assert 0.0 <= float(row["test_hit_at_2_mean"]) <= 1.0 and float(row["test_regret_at_2_mean"]) >= 0.0
     assert not any("loss" in c for c in row)
@@ -492,12 +522,30 @@ def test_run_selection_baseline_rows_and_label_access(env, tmp_path, method):
 
     # Reuse: no recomputation and no duplicate rows unless save_skipped.
     assert selection_run.run_selection_baseline(cfg, infra=infra) == 0
-    assert len(_read_tsv(tmp_path / "results" / "moe_routergfm_selection.tsv")) == 2
+    assert len(_read_tsv(tmp_path / "results" / "moe_routergfm_selection.tsv")) == 1
     cfg.save_results.save_skipped = True
     assert selection_run.run_selection_baseline(cfg, infra=infra) == 0
     again = _read_tsv(tmp_path / "results" / "moe_routergfm_selection.tsv")
-    assert len(again) == 4 and again[2]["test_hit_at_2_mean"] == row["test_hit_at_2_mean"]
+    assert len(again) == 2 and again[1]["test_hit_at_2_mean"] == row["test_hit_at_2_mean"]
 
+
+
+def test_table9_row_pools_two_or_more_classification_datasets(tmp_path):
+    cfg = tiny_cfg(Path("/nonexistent"), write_checkpoints=False)
+    cfg.save_results.output_dir = str(tmp_path / "results")
+
+    def item(dataset, level, family, hit):
+        outcome = SelectionOutcome.from_ranking(AppSpec(dataset, level, 3, 42), [("e0", 1.0), ("e1", 0.0)], 2)
+        return outcome, {"test_hit_at_2": hit}, family
+
+    now = datetime.now().astimezone()
+    single = [item("nodea", "node", "node_cls", 1.0), item("linka", "edge", "link", 0.0)]
+    append_selection_rows(cfg, "probe", single, now, now)  # one Table 9 dataset: no pooled row
+    append_selection_rows(cfg, "probe", single + [item("grapha", "graph", "graph_cls", 0.0)], now, now)
+    rows = _read_tsv(tmp_path / "results" / "moe_routergfm_selection.tsv")
+    assert [r["dataset"] for r in rows] == ["nodea", "linka", "nodea", "linka", "grapha", "table9_all"]
+    pooled = rows[-1]  # node + graph classification only (link excluded)
+    assert pooled["n_apps"] == "2" and float(pooled["test_hit_at_2_mean"]) == 0.5
 
 def test_registries():
     assert set(BASELINE_RUNNERS) == {"metagl_u", "sagmm_pe", "meta_des", "kdem", "ppem"}
@@ -594,3 +642,63 @@ def test_run_matched_baseline_tsv_dispatch_and_evaluate_fallback(env, tmp_path, 
     assert len(_read_tsv(tmp_path / "results" / "moe_kdem.tsv")) == 2
     (row,) = _read_tsv(tmp_path / "results" / "moe_evalonly.tsv")
     assert float(row["test_acc_mean"]) == 70.0 and float(row["test_risk_mean"]) == pytest.approx(0.2)
+
+
+def test_result_dir_tracks_dependencies_and_variant_keys(env):
+    cfg = env.cfg.clone()
+    rg = cfg.moe.routergfm
+    methods = {"metagl_u": "metagl_u", "kdem": "kdem_ppem", "ppem": "kdem_ppem", "sagmm_pe": "sagmm_pe",
+               "metagl": "metagl", "metagl_metadata": "metagl"}
+
+    def changed(edit):
+        before = {m: matched_run.result_dir(cfg, m, block, {"topk": 5}) for m, block in methods.items()}
+        edit()
+        return {m for m, block in methods.items() if matched_run.result_dir(cfg, m, block, {"topk": 5}) != before[m]}
+
+    assert changed(lambda: setattr(rg.baselines.metagl, "hid_dim", 7)) == {"metagl_u", "metagl", "metagl_metadata"}
+    assert changed(lambda: setattr(rg.graph, "use_text", False)) == {"metagl_u", "metagl_metadata"}
+    assert changed(lambda: setattr(rg.baselines.kdem_ppem.ema, "beta", 0.5)) == {"ppem"}
+    assert changed(lambda: setattr(rg.baselines.kdem_ppem.kd, "weight", 0.5)) == {"kdem"}
+    assert changed(lambda: setattr(rg.baselines.kdem_ppem, "k", 2)) == {"kdem", "ppem"}
+    assert changed(lambda: setattr(rg.baselines.kdem_ppem, "num_workers", 4)) == set()
+    assert changed(lambda: setattr(rg.heads, "type", "mlp")) == {"metagl_u", "kdem", "ppem"}
+
+    assert matched_run.identity_paths(cfg, "metagl_u", "metagl_u") == ["baselines.metagl_u", "baselines.metagl", "graph", "heads"]
+    kdem = matched_run.identity_paths(cfg, "kdem", "kdem_ppem")
+    assert "baselines.kdem_ppem.kd" in kdem and "baselines.kdem_ppem.ema" not in kdem and "heads.type" in kdem
+    assert matched_run.config_value(cfg, "heads.type") == "mlp" and matched_run.config_value(cfg, "no.such") is None
+
+
+def test_matched_rows_record_dependencies_not_routing_keys(env, tmp_path):
+    cfg = _matched_cfg(env, tmp_path)
+    cfg.moe.routergfm.baselines.datasets = ["photo:node"]
+    set_explicit_cfg_keys(cfg, ["moe.routergfm.baselines.tasks_tsv", "moe.routergfm.baselines.num_runs"])
+    for method in ("kdem", "metagl_u"):
+        assert matched_run.run_matched_baseline(cfg, method, _FakeRunner, infra=_fake_infra()) == 0
+    kdem = _read_tsv(tmp_path / "results" / "moe_kdem.tsv")[0]
+    assert json.loads(kdem["moe.routergfm.baselines.kdem_ppem.kd"])["weight"] == 0.01
+    assert kdem["moe.routergfm.heads.type"] == "linear" and not any(".ema" in c for c in kdem)
+    metagl_u = _read_tsv(tmp_path / "results" / "moe_metagl_u.tsv")[0]
+    assert json.loads(metagl_u["moe.routergfm.baselines.metagl_u"]) == {"selector": "metagl"}
+    assert json.loads(metagl_u["moe.routergfm.baselines.metagl"])["hid_dim"] == 32
+    assert {"moe.routergfm.graph", "moe.routergfm.heads", "moe.routergfm.baselines.num_runs"} <= set(metagl_u)
+    assert not any(c.endswith("tasks_tsv") for c in list(kdem) + list(metagl_u))
+
+
+def test_shared_candidates_nonpositive_pool_is_all_of_e_a():
+    pool = ["e0", "e1", "e2", "e3"]
+    infra = SimpleNamespace(
+        compatible_pool=lambda app: list(pool),
+        task_family=lambda app: "node_cls",
+        historical_applications=lambda app: [AppSpec("h", "node", 3, 42)],
+        historical_mu=lambda app, eid: (float(-pool.index(eid)), 1),  # later experts rank better
+    )
+    b = SimpleNamespace(candidate_rule="historical_mean", candidate_pool=2)
+    cfg = SimpleNamespace(moe=SimpleNamespace(routergfm=SimpleNamespace(baselines=b)))
+    app = AppSpec("t", "node", 3, 42)
+    assert candidate_experts(cfg, app, infra) == ["e2", "e3"]
+    for rule in CANDIDATE_RULES:
+        for size in (0, -1):
+            b.candidate_rule, b.candidate_pool = rule, size
+            assert candidate_experts(cfg, app, infra) == pool
+    assert sagmm_trainer.candidate_experts is meta_des_runner.candidate_experts is candidate_experts

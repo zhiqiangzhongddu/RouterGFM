@@ -580,6 +580,26 @@ def _few_shot_splits(cfg, level: str) -> List[Tuple[int, float, float]]:
     return [(int(s[0]), float(s[1]), float(s[2])) for s in defs if _is_few_shot_split_def(tuple(s))]
 
 
+def _skipped_featureless(cfg, root: Path, entry, featureless: Dict[Tuple[str, str], bool]) -> bool:
+    """A feature-condition entry that build skips: no file and a dataset without native features.
+
+    The dataset is loaded (once per name) only when the file is missing; if it
+    cannot be loaded the entry stays and verification reports the missing file.
+    """
+    name, level, seed, split = entry
+    if split_file_path(root, name, level, seed, split).is_file():
+        return False
+    if (name, level) not in featureless:
+        try:
+            featureless[(name, level)] = bool(load_shift_source(cfg, name, level).featureless)
+        except Exception as exc:  # pylint: disable=broad-except
+            print(f"[Shift][Error] {name} ({level}): cannot check for native features: {exc}")
+            featureless[(name, level)] = False
+        if featureless[(name, level)]:
+            print(f"[Shift] Verify skips {name} (feature): no native node features, never built.")
+    return featureless[(name, level)]
+
+
 def run_shift_preparation(cfg) -> int:
     """Build and/or verify the shift split roots for ``data_preparation.target_datasets``.
 
@@ -621,8 +641,11 @@ def run_shift_preparation(cfg) -> int:
                 print(f"[Shift][Error] {name} ({level}): {exc}")
                 status = 1
     if bool(sh.verify):
+        featureless: Dict[Tuple[str, str], bool] = {}
         for condition in conditions:
             entries = [(name, level, seed, split) for name, level, splits in plan for seed in seeds for split in splits]
+            if condition == "feature":
+                entries = [e for e in entries if not _skipped_featureless(cfg, Path(sh.root) / condition, e, featureless)]
             try:
                 verify_shift_root(Path(sh.root) / condition, entries)
             except ValueError as exc:

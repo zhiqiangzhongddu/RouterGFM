@@ -12,6 +12,7 @@ node features; they live on evaluation edges, which :func:`masked_edges` hides.
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -21,7 +22,9 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 
-from .common import TASK_FAMILIES, AppSpec, ExpertSpec, base_group, is_same_source
+from src.utils.checkpoint import save_json_atomic
+
+from .common import TASK_FAMILIES, AppSpec, ExpertSpec, RouterPaths, base_group, is_same_source
 from .text import (
     describe_application,
     describe_architecture,
@@ -110,15 +113,48 @@ def _num_params(checkpoint_path: str) -> float:
     return float(sum(v.numel() for v in state.values() if torch.is_tensor(v) and v.is_floating_point()))
 
 
-def expert_numeric(spec: ExpertSpec, corpus_stats: Optional[Mapping[str, float]] = None) -> torch.Tensor:
+def expert_num_params(cfg, specs: Sequence[ExpertSpec]) -> Dict[str, float]:
+    """#floating-point parameters per expert id (NaN when the checkpoint is absent).
+
+    Cached next to the catalog in ``<output_root>/experts/params.json``, keyed by
+    expert id and invalidated when the checkpoint's path, size or mtime changes,
+    so building H does not reload every checkpoint.
+    """
+    path = RouterPaths.from_cfg(cfg).catalog_file.with_name("params.json")
+    cache = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    out, dirty = {}, False
+    for spec in specs:
+        checkpoint = str(spec.checkpoint_path)
+        try:
+            st = os.stat(checkpoint)
+        except OSError:
+            out[spec.expert_id] = _NAN
+            continue
+        stamp = [checkpoint, st.st_size, st.st_mtime_ns]
+        entry = cache.get(spec.expert_id)
+        if entry is None or entry.get("stamp") != stamp:
+            entry = cache[spec.expert_id] = {"stamp": stamp, "n_params": _num_params(checkpoint)}
+            dirty = True
+        out[spec.expert_id] = float(entry["n_params"])
+    if dirty:
+        save_json_atomic(str(path), cache)
+    return out
+
+
+def expert_numeric(
+    spec: ExpertSpec, corpus_stats: Optional[Mapping[str, float]] = None, *, num_params: Optional[float] = None
+) -> torch.Tensor:
     """Raw expert metadata in :data:`EXPERT_NUMERIC_NAMES` order (NaN = missing).
 
     No architecture/objective identity one-hots: identity enters through text
     and construction edges so unseen architectures remain representable.
+    ``num_params`` (from :func:`expert_num_params`) skips reading the checkpoint.
     """
     match = _DIMS_RE.search(spec.expert_id)
     hidden, out, layers = (float(g) for g in match.groups()) if match else (_NAN, _NAN, _NAN)
-    values = [_slog(hidden), _slog(out), layers, _slog(_num_params(str(spec.checkpoint_path)))]
+    if num_params is None:
+        num_params = _num_params(str(spec.checkpoint_path))
+    values = [_slog(hidden), _slog(out), layers, _slog(num_params)]
     values += [1.0 if spec.source_task_level == lvl else 0.0 for lvl in SOURCE_LEVELS]
     values += [_slog((corpus_stats or {}).get("num_instances"))]
     return torch.tensor(values, dtype=torch.float32)
@@ -196,7 +232,8 @@ def expert_feature_vector(
 ) -> torch.Tensor:
     """Raw expert metadata vector (text ⊕ unstandardized numeric; NaN = missing)."""
     text = describe_expert(spec, description_dir=str(cfg.moe.routergfm.graph.description_dir))
-    return _raw_features([text], expert_numeric(spec, corpus_stats)[None], text_encoder, cfg)[0]
+    numeric = expert_numeric(spec, corpus_stats, num_params=expert_num_params(cfg, [spec])[spec.expert_id])
+    return _raw_features([text], numeric[None], text_encoder, cfg)[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -312,7 +349,11 @@ def build_context_graph(
     arch_names = list(dict.fromkeys(s.architecture for s in catalog))
     objective_names = list(dict.fromkeys(s.objective for s in catalog))
     app_num = _stack(app_rows, len(APP_NUMERIC_NAMES))
-    expert_num = _stack([expert_numeric(s, corpus_stats[s.source]) for s in catalog], len(EXPERT_NUMERIC_NAMES))
+    num_params = expert_num_params(cfg, catalog)
+    expert_num = _stack(
+        [expert_numeric(s, corpus_stats[s.source], num_params=num_params[s.expert_id]) for s in catalog],
+        len(EXPERT_NUMERIC_NAMES),
+    )
     if numeric_stats is None:
         numeric_stats = {APP: _fit_standardizer(app_num), EXPERT: _fit_standardizer(expert_num)}
     expert_texts = [describe_expert(s, description_dir=desc_dir) for s in catalog]
@@ -471,7 +512,8 @@ def insert_expert(
         row = _node_features([text], numeric, graph.numeric_stats[APP], text_encoder, cfg)
         _append_app_node(graph, corpus_key, corpus_key, row)
     corpus = graph.app_index[corpus_key]
-    numeric = expert_numeric(spec, graph.corpus_stats.get(spec.source))[None]
+    num_params = expert_num_params(cfg, [spec])[spec.expert_id]
+    numeric = expert_numeric(spec, graph.corpus_stats.get(spec.source), num_params=num_params)[None]
     text = describe_expert(spec, description_dir=desc_dir)
     node = _append_node(graph, EXPERT, _node_features([text], numeric, graph.numeric_stats[EXPERT], text_encoder, cfg))
     graph.expert_ids.append(spec.expert_id)
@@ -527,6 +569,7 @@ __all__ = [
     "build_context_graph",
     "corpus_stats_for",
     "expert_feature_vector",
+    "expert_num_params",
     "expert_numeric",
     "insert_application",
     "insert_expert",

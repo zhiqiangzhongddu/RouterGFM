@@ -306,6 +306,16 @@ class SyntheticDataProvider:
         }
         return assemble_app_data(app, meta, dataset, self.max_diagnostic)
 
+    def base_graph(self, app: AppSpec) -> Data:
+        """Synthetic input graph: the disjoint union of the dataset's instance graphs (no queried pair is an edge)."""
+        if app.task_level not in ("node", "edge"):
+            raise ValueError(f"{app.key}: only node and link applications have a single base graph.")
+        parts, offset = [], 0
+        for graph in self.dataset(app.dataset, app.task_level).graphs:
+            parts.append(graph.edge_index + offset)
+            offset += int(graph.num_nodes)
+        return Data(edge_index=torch.cat(parts, dim=1), num_nodes=offset)
+
 
 # --------------------------------------------------------------------------- #
 # Tiny expert checkpoints
@@ -407,7 +417,6 @@ def tiny_cfg(
     rg = cfg.moe.routergfm
     rg.output_root = str(tmp_path / "routergfm")
     rg.device_batch_size = 32
-    rg.num_workers = 0
 
     rg.experts.checkpoint_root = str(ckpt_root)
     rg.experts.architectures = list(archs)

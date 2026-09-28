@@ -8,6 +8,7 @@ import pytest
 import torch
 from torch_geometric.data import Batch, Data
 
+from src.data_loader import dataset_domains
 from src.moe.routergfm import applications as apps_mod
 from src.moe.routergfm import heads as heads_mod
 from src.moe.routergfm.applications import (
@@ -40,6 +41,7 @@ from src.moe.routergfm.experts import (
 from src.moe.routergfm.heads import fit_head, fit_predict_oof, oof_fold_ids, predict_head
 from src.moe.routergfm.losses import RegressionNormalizer, mixture_loss, routing_loss, to_metric_inputs
 from src.moe.routergfm.readout import graph_query_representation, readout_dim
+from src.moe.routergfm.text import dataset_domain
 from src.utils.metrics import compute_supervised_metrics
 from tests.routergfm.fixtures import (
     FEATURE_DIM,
@@ -306,6 +308,21 @@ def test_fit_head_link_multilabel_regression():
     assert routing_loss(reg, norm.transform(reg_y), REGRESSION).mean() < 0.1
 
 
+def test_fit_head_scale_floor_bounds_few_shot_regression_extrapolation():
+    """5 support graphs with a near-constant readout dim: a query off that dim must not explode (real QM7b)."""
+    g = torch.Generator().manual_seed(0)
+    x = torch.randn(5, 4, generator=g)
+    x[:, 3] = 1.0 + 1e-5 * torch.randn(5, generator=g)
+    y = 3.0 * x[:, :1] + 1.0
+    norm = RegressionNormalizer().fit(y)
+    head = fit_head(x, y, REGRESSION, 1, _head_cfg(), seed=0, normalizer=norm)
+    query = x.clone()
+    query[:, 3] = 2.0  # one unit off a dimension whose support std is 1e-5
+    pred = predict_head(head, query)
+    assert torch.isfinite(pred).all() and float(pred.abs().max()) < 50.0
+    assert float(head.std[3]) >= 0.1 * float(x.std(dim=0, unbiased=False).pow(2).mean().sqrt()) - 1e-6
+
+
 def test_oof_folds_are_stratified_and_held_out(monkeypatch):
     y = torch.tensor([0] * 7 + [1] * 5 + [2] * 2)
     fold_id = oof_fold_ids(y, NODE_CLS, 3, seed=1)
@@ -339,6 +356,24 @@ def test_oof_folds_are_stratified_and_held_out(monkeypatch):
     assert all(item not in trained_on[head] for item, head in predicted_by.items())
     with pytest.raises(ValueError):
         fit_predict_oof(x[:1], y[:1], NODE_CLS, 3, _head_cfg(epochs=5), seed=0)
+
+
+def test_regression_oof_is_strictly_out_of_fold():
+    """Leave-one-out: item i's raw-unit OOF prediction does not depend on y_i (not even via normalization)."""
+    g = torch.Generator().manual_seed(0)
+    x = torch.randn(5, 4, generator=g)
+    y = 1000.0 + 100.0 * torch.randn(5, 2, generator=g)
+    cfg = _head_cfg(epochs=20)
+
+    def raw_oof(targets):
+        norm = RegressionNormalizer().fit(targets)
+        return norm.inverse(fit_predict_oof(x, targets, REGRESSION, 2, cfg, seed=0, folds=5, normalizer=norm))
+
+    base = raw_oof(y)
+    for i in range(5):
+        moved = y.clone()
+        moved[i] += 500.0
+        torch.testing.assert_close(raw_oof(moved)[i], base[i], rtol=1e-4, atol=1e-3)
 
 
 # --------------------------------------------------------------------------- #
@@ -378,6 +413,21 @@ def test_stats_features():
     assert vec.numel() == len(stat_feature_names()) and torch.isfinite(vec).all()
     assert build_stats(level="graph", family=GRAPH_CLS, num_instances=1, num_nodes=1, num_edges=0,
                        feature_dim=1, num_classes=2, domain="nope", budget=1)["domain_unknown"] == 1.0
+
+
+def test_dataset_domain_and_stats_share_one_vocabulary():
+    """Every domain the metadata text can name one-hot encodes as itself (mnist was 'unknown')."""
+    names = ["mnist", "cifar10", "proteins", "flickr", "actor", "qm7b", "toxcast", "ogbn-arxiv", "photo", "dblp",
+             "cornell", "chameleon", "airports", "modelnet10", "fb15k", "nope"]
+    names += list(dataset_domains.NAME_TO_DOMAIN) + [kws[0] for _, kws in dataset_domains.KEYWORD_DOMAINS]
+    for name in names:
+        domain = dataset_domain(name)
+        assert domain in apps_mod.DOMAINS
+        stats = build_stats(level="graph", family=GRAPH_CLS, num_instances=1, num_nodes=1, num_edges=0,
+                            feature_dim=1, num_classes=2, domain=domain, budget=1)
+        assert stats[f"domain_{domain}"] == 1.0 and sum(stats[f"domain_{d}"] for d in apps_mod.DOMAINS) == 1.0
+    assert dataset_domain("mnist") != "unknown"
+    assert set(dataset_domains.CLASS_TO_DOMAIN.values()) <= set(apps_mod.DOMAINS)  # real-data class domains
 
 
 def test_instance_set_key():
@@ -444,6 +494,64 @@ def test_real_provider_meta_cache_and_lazy_dataset(tmp_path, monkeypatch, level)
     assert calls == []
     assert torch.equal(other.query_pos, data.query_pos) and other.stats["budget"] == budget
     assert len(other.dataset) == 24 and len(calls) == 1
+
+
+def test_real_provider_lru_bounds_live_datasets(tmp_path, monkeypatch):
+    import gc
+    import weakref
+
+    import src.data_loader as data_loader
+
+    built = []
+
+    def fake_create_dataset(**kwargs):
+        dataset = _fake_induced("edge")
+        built.append(weakref.ref(dataset))
+        return dataset
+
+    monkeypatch.setattr(data_loader, "create_dataset", fake_create_dataset)
+    cfg = _base_cfg(tmp_path)
+    cfg.moe.routergfm.apps.max_diagnostic = 8
+    cfg.moe.routergfm.apps.data.split_root = str(tmp_path / "splits")
+    provider = RealDataProvider(cfg)
+    held = [provider.load(AppSpec("cora", "edge", 2, seed)) for seed in range(6)]  # LP sets differ per seed
+    for data in held:  # AppData held for the process lifetime, as RouterInfra does
+        assert len(data.dataset) == 24
+    count = len(built)
+    assert held[-1].dataset[1].num_nodes == 4 and len(built) == count  # cached: no rebuild
+    gc.collect()
+    assert sum(ref() is not None for ref in built) <= provider.max_cached_datasets
+
+
+def test_real_provider_base_graph_excludes_held_out_positives(tmp_path, monkeypatch):
+    import networkx as nx
+
+    import src.data_loader.datasets as datasets_mod
+    from src.data_loader.dataset_splits import _canonical_split_dataset_name, _get_or_create_edge_split_payload
+
+    g = nx.gnm_random_graph(40, 120, seed=0)
+    ei = torch.tensor(list(g.edges()), dtype=torch.long).t()
+    base = Data(edge_index=torch.cat([ei, ei.flip(0)], dim=1), x=torch.randn(40, 3), num_nodes=40)
+    monkeypatch.setattr(datasets_mod, "_load_node_dataset", lambda name, root, transform: [base])
+    cfg = _base_cfg(tmp_path)
+    cfg.moe.routergfm.apps.data.split_root = str(tmp_path / "splits")
+    provider = RealDataProvider(cfg)
+
+    node = provider.base_graph(AppSpec("cora", "node", 5, 42))
+    assert torch.equal(node.edge_index, base.edge_index) and node.num_nodes == 40 and "y" not in node
+
+    app = AppSpec("cora", "edge", 5, 42)
+    link = provider.base_graph(app)
+    payload = _get_or_create_edge_split_payload(
+        dataset_name=_canonical_split_dataset_name("cora", "edge", 42), split=app.split, seed=42,
+        split_root_path=tmp_path / "splits", data=base, verbose=False,
+    )
+    context = {tuple(p) for p in link.edge_index.t().tolist()}
+    held = [tuple(base.edge_index[:, i].tolist()) for i in payload["val_pos_idx"] + payload["test_pos_idx"]]
+    assert held and not any(p in context or p[::-1] in context for p in held)
+    assert link.edge_index.size(1) == len(payload["context_pos_idx"]) and link.num_nodes == 40
+    with pytest.raises(ValueError):
+        provider.base_graph(AppSpec("cora", "graph", 5, 42))
 
 
 # --------------------------------------------------------------------------- #

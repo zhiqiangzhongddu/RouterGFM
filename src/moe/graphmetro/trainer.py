@@ -22,7 +22,13 @@ from torch import optim
 from src.data_loader import create_dataset, dataset_info, log_split_instance_counts
 from src.moe.identity import behavior_fingerprint
 from src.moe.routergfm.common import REGRESSION, infer_task_family
-from src.moe.shift_eval import brier_risk, collect_query_outputs, save_query_predictions
+from src.moe.shift_eval import (
+    brier_risk,
+    collect_query_outputs,
+    raw_outputs,
+    save_query_predictions,
+    support_normalizer,
+)
 from src.utils.checkpoint import save_checkpoint, save_training_log
 from src.utils.dataset_helpers import (
     is_few_shot_split,
@@ -199,6 +205,9 @@ class GraphMETRORunner:
             induced=induced,
             prefix="[GraphMETRO][Split]",
         )
+        task_type = resolve_task_type(getattr(ds_cfg, "task_type", None))
+        family = infer_task_family(raw_task_level, task_type, int(getattr(ds_cfg, "label_dim", 1) or 1))
+        self.task.normalizer = support_normalizer(self.train_loader.dataset, family)
 
     # ------------------------------------------------------------------ #
     # Monitoring
@@ -340,7 +349,8 @@ class GraphMETRORunner:
         family = infer_task_family(self.task_level_raw, task_type, label_dim)
         self.model.eval()
         outputs = collect_query_outputs(
-            lambda batch: self.model(batch)[0], self.test_loader, self.device, task_type, label_dim,
+            lambda batch: raw_outputs(self.task.normalizer, self.model(batch)[0]),
+            self.test_loader, self.device, task_type, label_dim,
         )
         support_targets = None
         if family == REGRESSION:

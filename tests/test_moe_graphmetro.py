@@ -20,6 +20,8 @@ from src.moe.graphmetro.model import GraphMETROModel
 from src.moe.graphmetro.run import _build_task_cfg, parse_graphmetro_tasks, run_graphmetro
 from src.moe.graphmetro.task import GraphMETROTask
 from src.moe.graphmetro.trainer import GraphMETRORunner
+from src.moe.routergfm.common import REGRESSION
+from src.moe.shift_eval import brier_risk, normalized_targets
 from src.moe.graphmetro.transforms import (
     TRANSFORM_NAMES,
     apply_shift,
@@ -61,6 +63,7 @@ def _node_graphs(count=12, seed=0, num_classes=3):
         )
         graph.base_node_id = 100 + i
         graph.index = 100 + i
+        graph.split = "train"  # InducedGraphDataset split tag (string)
         graphs.append(graph)
     return graphs
 
@@ -183,6 +186,7 @@ class TransformInvariantTest(unittest.TestCase):
             same = torch.allclose(out.x[out.target_node_index], batch.x[batch.target_node_index])
             self.assertEqual(same, not noisy)
             self.assertTrue(torch.equal(out.base_node_id, batch.base_node_id))
+            self.assertEqual(out.split, batch.split)
         elif level == "edge":
             for side in (0, 1):
                 same = torch.allclose(out.x[out.edge_label_index[side]], batch.x[batch.edge_label_index[side]])
@@ -458,6 +462,37 @@ class GraphMETRORunnerSmokeTest(unittest.TestCase):
 
                 cfg.moe.graphmetro.skip_if_exists = True
                 self.assertTrue(GraphMETRORunner(cfg)._skip_due_to_existing_checkpoint)
+
+    def test_regression_trains_on_normalized_targets_and_reports_raw_units(self):
+        graphs = _graph_graphs(kind="reg")
+        gen = torch.Generator().manual_seed(5)
+        for graph in graphs:
+            graph.y = 1000.0 + 100.0 * torch.randn(1, 2, generator=gen)  # QM7b-like target scale
+        _, _, meta, split, _ = _FAMILIES["regression"]
+        seen = []
+
+        def record(normalizer, y):
+            out = normalized_targets(normalizer, y)
+            seen.append(out.detach().cpu())
+            return out
+
+        with tempfile.TemporaryDirectory() as tmp, _patched_data(graphs, meta), patch(
+            "src.moe.graphmetro.task.normalized_targets", record
+        ):
+            cfg = _cfg(tmp, level="graph", epochs=2, batch_size=4, num_runs=1)
+            cfg.moe.graphmetro.dataset.task_type = meta["task_type"]
+            cfg.moe.graphmetro.dataset.fixed_split = split
+            runner = GraphMETRORunner(cfg)
+            runner.fit()
+            preds = torch.load(runner.prediction_path(), map_location="cpu")
+        self.assertTrue(seen and float(torch.cat(seen).abs().median()) < 5.0)  # unit-scale training targets
+        support = torch.cat([graph.y for graph in graphs[:6]])
+        self.assertLess(abs(float(preds["pred"].mean()) - float(support.median())), 500.0)  # raw-unit outputs
+        zero = brier_risk(
+            {"pred": torch.zeros_like(preds["pred"]), "y": preds["y"]}, task_family=REGRESSION, support_targets=support,
+        )
+        self.assertLess(runner.best_metrics["test_brier"], zero)
+        self.assertLess(runner.best_metrics["test_mae"], 500.0)
 
     def test_run_name_identity(self):
         cfg = _cfg()
